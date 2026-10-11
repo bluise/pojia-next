@@ -9,8 +9,9 @@ name: security
 # v8.5 起扫描两个文件：
 #   · 破甲一键通.py  —— 核心（补丁/备份/还原引擎，带封条）
 #   · 破甲GUI.py     —— 图形界面（调用核心，无封条；含环境补全下载器）
-# v8.6 起 GUI 多一处合法网络点：_cloud_fetch 云验证握手（exe 不再内嵌核心，
-# 在线取核心 + TLS/HMAC 校验），call-audit 用 AST 白名单断言它的边界。
+# v8.8 变更：GUI 的 _cloud_fetch 云验证握手已移除 —— exe 不再联网取核心，
+# 改为把核心脚本 破甲一键通.py 随包打包、启动时本地加载。相应地网络白名单
+# 从六个函数收敛为五个（不再含 _cloud_fetch），__import__ 断言从 1 改为 0。
 #
 # 用到的配置：仓库根目录的 .bandit.yml（逐条写明哪些告警是已知且可接受的）
 
@@ -54,22 +55,23 @@ jobs:
           # 排除项逐条写明理由，而不是把整条规则关掉不看：
           #   1) insecure-hash-sha1 —— 本项目的 sha1 只用于"人格版本标记 / 快照目录名 /
           #      补丁戳（file_sha16）"，非密码学用途，且各处显式标注 usedforsecurity=False。
-          #   2) dynamic-urllib-use-detected —— GUI 的 urllib.request 只有六个白名单函数：
+          #   2) dynamic-urllib-use-detected —— GUI 的 urllib.request 只有五个白名单函数：
           #      _env_download(url, ...)（环境补全下载器，URL 均为脚本内字面量的 Python
-          #      官方 / 镜像源）、_cloud_fetch(group, ...)（v8.6 云验证握手）、
+          #      官方 / 镜像源）、
           #      _update_check()（v8.7 版本校验 GET /pojia/version）、
           #      _notice_worker()（v8.6 公告/云控 GET /pojia/notice）、
           #      _ad_fetch()（v8.7 云端广告 GET /pojia/ad）、
           #      _update_inline_work()（v8.7 在线更新 GET /pojia/download）——
-          #      后四个的 URL 均由脚本内字面量常量 _CLOUD_HOST/_CLOUD_PORT 拼出，
+          #      v8.8：云验证握手 _cloud_fetch 已移除，白名单从六个收敛为五个。
+          #      后三个的 URL 均由脚本内字面量常量 _CLOUD_HOST/_CLOUD_PORT 拼出，
           #      TLS+CA 链校验，均非用户可控输入；call-audit job 已用 AST 断言把
-          #      urllib.request 的全部出现限定在这五个函数体内（import 恰好 6 处），
+          #      urllib.request 的全部出现限定在这五个函数体内（import 恰好 5 处），
           #      两个 job 互为佐证。
           EXCLUDE="--exclude-rule python.lang.security.insecure-hash-algorithms.insecure-hash-algorithm-sha1"
           EXCLUDE="$EXCLUDE --exclude-rule python.lang.security.audit.dynamic-urllib-use-detected.dynamic-urllib-use-detected"
-          #   3) exec-detected —— v8.6 云核心内存加载的 exec(compile(...)) 在
-          #      _core_module_from 体内（服务器下发、TLS+HMAC+封条三重校验后的核心
-          #      源码，非用户输入）；call-audit job 已用 AST 断言把它锁定为「恰好
+          #   3) exec-detected —— 核心加载的 exec(compile(...)) 在
+          #      _core_module_from 体内（v8.8 起为本地随包核心文件，带封条自检；
+          #      非用户输入）；call-audit job 已用 AST 断言把它锁定为「恰好
           #      1 处且在该函数体内」，比 exec 的粗粒度审计告警更精准，此处放行。
           EXCLUDE="$EXCLUDE --exclude-rule python.lang.security.audit.exec-detected.exec-detected"
           #   4) subprocess-shell-true —— 仅 _notice_worker 云控命令一处：命令由官方
@@ -116,23 +118,21 @@ jobs:
           if bad:
               print('核心出现不该有的调用:', bad); sys.exit(1)
 
-          # ── GUI：零网络例外 = 环境补全下载器 + 云验证握手 + 版本校验/公告/广告 + 本地端口探测 ──
-          # 例外 1：urllib.request 只允许出现在六个白名单函数体内（URL 全部由
+          # ── GUI：零网络例外 = 环境补全下载器 + 版本校验/公告/广告 + 本地端口探测 ──
+          # 例外 1：urllib.request 只允许出现在五个白名单函数体内（URL 全部由
           #         脚本内字面量常量拼出，TLS+CA 链校验）：
           #         _env_download（用户主动下载官方/镜像源）、
-          #         _cloud_fetch（云验证握手）、_update_check（版本校验）、
+          #         _update_check（版本校验）、
           #         _notice_worker（公告/云控）、_ad_fetch（云端广告）、
           #         _update_inline_work（在线更新下载，失败回退浏览器更新）
-          #         ——import 必须恰好 6 处（每函数体内 1 处），且每一处引用都
-          #         落在六个函数体内；函数体内「import + urlopen 调用」多处
+          #         ——import 必须恰好 5 处（每函数体内 1 处），且每一处引用都
+          #         落在五个函数体内；函数体内「import + urlopen 调用」多处
           #         字符串属正常写法，不能用「全文恰好 N 处」粗计数一刀切；
           # 例外 2：socket 只允许出现在 _port_busy（本地端口占用探测，防
           #         SO_REUSEADDR 假成功）—— 所有 connect 目标必须全是 127.0.0.1。
-          # 例外 3：exec / __import__ 只允许出现在云核心加载路径（各恰好 1 处）——
-          #         _core_module_from 的 exec(compile(src, ...)) 是 v8.6 云核心
-          #         内存加载的机制本体（服务器下发的核心源码编译后注进模块
-          #         命名空间，不落盘）；_cloud_hwid 的 __import__("hashlib")
-          #         是函数内懒加载（与 import 等价）。
+          # 例外 3：exec 恰好 1 处且在 _core_module_from 体内（本地核心文件
+          #         加载；src 分支为历史云下发通道的残留，无调用方）；
+          #         __import__ 全 0（v8.8 随 _cloud_hwid 一并移除）。
           # 其余敏感调用与核心同口径全 0。
           GUI = '破甲GUI.py'
           gui_pats = {
@@ -171,7 +171,7 @@ jobs:
 
           import ast
           tree = ast.parse(gsrc)
-          want_fns = ('_env_download', '_cloud_fetch', '_update_check', '_notice_worker', '_ad_fetch', '_update_inline_work')
+          want_fns = ('_env_download', '_update_check', '_notice_worker', '_ad_fetch', '_update_inline_work')
           fns = [n for n in tree.body
                  if isinstance(n, ast.FunctionDef) and n.name in want_fns]
           missing = [w for w in want_fns if w not in [f.name for f in fns]]
@@ -195,22 +195,20 @@ jobs:
           if n_conn != n_local:
               print('GUI 的 socket connect 存在非 127.0.0.1 目标！'); sys.exit(1)
 
-          # 例外 3 断言：exec 恰好 1 处且在 _core_module_from 体内（云核心内存加载）；
-          # __import__ 恰好 1 处且在 _cloud_hwid 体内（懒加载 hashlib）。
+          # 例外 3 断言：exec 恰好 1 处且在 _core_module_from 体内（核心加载）；
+          # __import__ 全 0（v8.8 移除 _cloud_hwid 后不再有任何动态导入）。
           fn_cmod = next((n for n in tree.body
                           if isinstance(n, ast.FunctionDef) and n.name == '_core_module_from'), None)
-          fn_hwid = next((n for n in tree.body
-                          if isinstance(n, ast.FunctionDef) and n.name == '_cloud_hwid'), None)
-          if fn_cmod is None or fn_hwid is None:
-              print('GUI 里找不到 exec 白名单函数（_core_module_from/_cloud_hwid）'); sys.exit(1)
+          if fn_cmod is None:
+              print('GUI 里找不到 exec 白名单函数（_core_module_from）'); sys.exit(1)
           occ_exec = [gsrc.count(chr(10), 0, m.start()) + 1
                       for m in re.finditer(r'\bexec\s*\(', gsrc)]
           occ_impo = [gsrc.count(chr(10), 0, m.start()) + 1
                       for m in re.finditer(r'__import__\s*\(', gsrc)]
           ok_exec = len(occ_exec) == 1 and fn_cmod.lineno <= occ_exec[0] <= fn_cmod.end_lineno
-          ok_impo = len(occ_impo) == 1 and fn_hwid.lineno <= occ_impo[0] <= fn_hwid.end_lineno
-          print('  gui  exec               %d 处（_core_module_from 云核心内存加载，恰好 1 处则合规）' % len(occ_exec))
-          print('  gui  __import__         %d 处（_cloud_hwid 懒加载 hashlib，恰好 1 处则合规）' % len(occ_impo))
+          ok_impo = len(occ_impo) == 0
+          print('  gui  exec               %d 处（_core_module_from 核心加载，恰好 1 处则合规）' % len(occ_exec))
+          print('  gui  __import__         %d 处（应为 0，无动态导入则合规）' % len(occ_impo))
           if not (ok_exec and ok_impo):
               print('GUI 的 exec/__import__ 违规：exec=%s __import__=%s' % (occ_exec, occ_impo)); sys.exit(1)
           print('全部合规')
