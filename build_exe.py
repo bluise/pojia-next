@@ -71,6 +71,12 @@ def main():
         "--workpath", os.path.join(WORK, "work"),
         "--specpath", os.path.join(WORK, "spec"),
         "--add-data", "%s%c." % (SRC_COPY, os.pathsep),
+        # 核心脚本本体也作为数据随包：frozen 下 __file__ 指向
+        # _MEIPASS/破甲一键通.py，但那个路径默认只有编译进 PYZ 的 .pyc、
+        # 没有明文源码 —— _seal_read_source() 会返回 None，_k2 当场
+        # TypeError，exe 一起就 exit 3。带上原文件，封条自检才能读到
+        # 逐字节一致的源码并正常放行。
+        "--add-data", "%s%c." % (SCRIPT, os.pathsep),
         SCRIPT,
     ]
     print("PyInstaller:", " ".join(args[:6]), "...")
