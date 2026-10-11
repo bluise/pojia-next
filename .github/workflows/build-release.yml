@@ -60,7 +60,33 @@ jobs:
         run: python -m PyInstaller --noconfirm --clean 破甲一键通GUI.spec
 
       - name: 打包命令行 exe
-        run: python build_exe.py
+        run: python build_exe.py      # 脚本自带 --version/--check/--status 冒烟，失败即非零退出
+
+      - name: GUI exe 冒烟（真起进程 + 探端口）
+        run: |
+          set -u
+          ./dist/破甲一键通GUI.exe &
+          PID=$!
+          ok=""
+          # GUI 会在 8317~8336 里挑一个空闲端口
+          for i in $(seq 1 60); do
+            for p in $(seq 8317 8336); do
+              if curl -s --noproxy '*' --max-time 2 \
+                   "http://127.0.0.1:${p}/api/state" | grep -q '"core_file"'; then
+                ok=$p; break 2
+              fi
+            done
+            sleep 1
+          done
+          if [ -z "$ok" ]; then
+            echo "[!] GUI exe 冒烟失败 —— 不发布"
+            taskkill //PID "$PID" //F >/dev/null 2>&1 || true
+            exit 1
+          fi
+          echo "GUI exe 起在端口 $ok"
+          curl -s --noproxy '*' --max-time 5 "http://127.0.0.1:${ok}/api/state" \
+            | python -c "import json,sys; d=json.load(sys.stdin); print('core_file =', d.get('core_file'))"
+          taskkill //PID "$PID" //F >/dev/null 2>&1 || true
 
       - name: 整理附件
         id: pack
