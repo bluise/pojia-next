@@ -59,208 +59,11 @@ if getattr(sys, "frozen", False):        # PyInstaller 打包后：以 exe 所�
 else:
     HERE = os.path.dirname(os.path.abspath(__file__))
 
-# ------------------------------------------- 云端核心下发（v8.5 加密版·协议 v2）
-# exe 空壳化：核心脚本不进 exe，启动时从官方服务器拉取。
 _CLOUD_HOST = "103.212.186.16"
 _CLOUD_PORT = 443
-_CLOUD_MSG = {
-    "NET":    "连不上官方服务器，请检查网络后重试",
-    "PIN":    "安全校验失败（证书指纹不匹配），可能被劫持",
-    "SIG":    "安全校验失败（签名无效），载荷可能被篡改",
-    "GROUP":  "群号不对 —— 加入官方 QQ 交流群，群公告里看群号",
-    "REVOKE": "本设备已被吊销授权，请到群里反馈",
-    "EXPIRED": "响应已过期，请重试",
-    "BANNED": "尝试次数过多，本机已被临时限制 —— 约半小时后自动解除，请稍等再试",
-    "SERVER": "服务器内部错误，请稍后重试",
-}
-
-
-class CloudError(Exception):
-    """code: NET / PIN / SIG / GROUP / REVOKE / EXPIRED / BANNED / SERVER"""
-
-# v8.6：服务端临时封禁的剩余秒数（_cloud_fetch 捕获，_cloud_verify 展示用）
-_BAN_RETRY = [0]
-
-
-
-def _cloud_hwid():
-    parts = []
-    try:
-        import winreg
-        with winreg.OpenKey(winreg.HKEY_LOCAL_MACHINE,
-                            r"SOFTWARE\Microsoft\Cryptography") as k:
-            parts.append(winreg.QueryValueEx(k, "MachineGuid")[0])
-    except Exception:
-        parts.append("no-guid")
-    try:
-        import ctypes
-        buf = ctypes.create_unicode_buffer(512)
-        ctypes.windll.kernel32.GetVolumeInformationW(
-            ctypes.c_wchar_p(os.environ.get("SystemDrive", "C:") + "\\"),
-            None, 0, None, None, None, buf, 512)
-        parts.append(buf.value)
-    except Exception:
-        parts.append("no-vol")
-    return __import__("hashlib").sha256("|".join(parts).encode("utf-8")).hexdigest()[:40]
-
-
-def _cloud_osver():
-    try:
-        import winreg
-        k = winreg.OpenKey(winreg.HKEY_LOCAL_MACHINE,
-                           r"SOFTWARE\Microsoft\Windows NT\CurrentVersion")
-
-        def g(name):
-            try:
-                return str(winreg.QueryValueEx(k, name)[0])
-            except OSError:
-                return ""
-        prod = g("ProductName") or "Windows"
-        disp = g("DisplayVersion")
-        build, ubr = g("CurrentBuildNumber"), g("UBR")
-        out = " ".join(x for x in (prod, disp) if x)
-        if build:
-            out += " (build %s.%s)" % (build, ubr or "0")
-        return out.strip() or sys.platform
-    except Exception:
-        try:
-            v = sys.getwindowsversion()
-            return "Windows %d.%d build %d" % (v.major, v.minor, v.build)
-        except Exception:
-            return sys.platform
-
-
-def _cloud_fetch(group, ver="", timeout=25):
-    # ver 留空 → 运行时取 DISPLAY_VER（定义顺序在后面，不能当默认参数）
-    ver = ver or DISPLAY_VER
-    """v3 云握手（纯标准库）。成功返回核心源码 bytes，失败抛 CloudError(code)。
-
-    TLS 1.3 通道（内置官方 CA 链校验）承载二进制帧（sig|sha|len|core），
-    落地校验：核心哈希自证 → HMAC-SHA256 认证
-    （sig 覆盖 hwid|group|sha256(core)|nonce|ts —— 防假服务器 / 防改核心 /
-    防重放 / 换机即废；伪造应答需要真核心才能过封条，真核心只在官方服务器）。
-    """
-    import hashlib, secrets, time
-    import urllib.request as _ur
-
-    hw = _cloud_hwid()
-    nonce = secrets.token_hex(16)
-    ts = int(time.time())
-    payload = json.dumps({"hwid": hw, "group": group, "ver": ver,
-                          "osv": _cloud_osver(),
-                          "nonce": nonce, "ts": ts}).encode()
-
-    cafile = os.path.join(getattr(sys, "_MEIPASS", "") or HERE, "ca.pem")
-    try:
-        import ssl as _ssl
-        ctx = _ssl.create_default_context(cafile=cafile)
-        req = _ur.Request("https://%s:%d/pojia/fetch" % (_CLOUD_HOST, _CLOUD_PORT),
-                          data=payload,
-                          headers={"Content-Type": "application/json",
-                                   "User-Agent": "pojia-gui/" + ver})
-        try:
-            with _ur.urlopen(req, timeout=timeout, context=ctx) as resp:
-                ctype = resp.headers.get("Content-Type", "")
-                body = resp.read()
-        except _ur.HTTPError as he:      # 4xx/5xx 应答体是 JSON 错误信息
-            ctype = "application/json"
-            body = he.read()
-    except Exception as e:
-        raise CloudError("NET") from e
-
-    if ctype.startswith("application/json"):
-        # 错误应答：按 err 文案分流
-        try:
-            r = json.loads(body)
-            err = str(r.get("err", ""))
-        except Exception:
-            err = ""
-        if err == "group wrong":
-            raise CloudError("GROUP")
-        if err == "pirate":
-            # v8.6.1：弹窗文案改为服务器可配（pirate.json），本地只是兜底
-            try:
-                _PIRATE_REMOTE["text"] = str(r.get("text") or "")[:1000]
-                _PIRATE_REMOTE["title"] = str(r.get("title") or "")[:80]
-                _PIRATE_REMOTE["url"] = str(r.get("url") or "")[:200]
-            except Exception:
-                pass
-            raise CloudError("PIRATE")
-        if err == "revoked":
-            raise CloudError("REVOKE")
-        if err == "banned":
-            # v8.6：爆破检测临时封禁 —— 带上服务端给的剩余秒数展示
-            try:
-                _BAN_RETRY[0] = int(r.get("retry") or 0)
-            except Exception:
-                _BAN_RETRY[0] = 0
-            raise CloudError("BANNED")
-        if err == "slow down":
-            raise CloudError("NET")
-        raise CloudError("SERVER")
-
-    # 二进制帧：hmac(32) | sha256(core)(32) | len(4) | core
-    if len(body) < 68:
-        raise CloudError("SERVER")
-    sig = body[:32]
-    core_sha = body[32:64].hex()
-    core_len = int.from_bytes(body[64:68], "big")
-    core_b = body[68:68 + core_len]
-    if len(core_b) != core_len:
-        raise CloudError("SERVER")
-
-    # ① 核心哈希自证：帧内哈希与实际内容不一致 = 传输中被换
-    if hashlib.sha256(core_b).hexdigest() != core_sha:
-        raise CloudError("SIG")
-
-    # ② HMAC-SHA256 认证：sig 覆盖 hwid|group|sha256(core)|nonce|ts
-    msg = "|".join([hw, group, core_sha, nonce, str(ts)]).encode("utf-8")
-    key = hashlib.sha256(b"pojia-cloud-hmac-v3|34839810|key").digest()
-    import hmac as _hm
-    if not _hm.compare_digest(_hm.new(key, msg, "sha256").digest(), sig):
-        raise CloudError("SIG")
-    return core_b
-
-# 云模式状态机：wait_group（等输群号）→ loading → ok / error:<code>
-_CLOUD_STATE = {"state": "local"}          # local=本地核心模式，无需云验证
-_CLOUD_GROUP_FILE = os.path.join(
+_CLOUD_STATE_FILE = os.path.join(
     os.environ.get("LOCALAPPDATA") or HERE, "破甲一键通", "cloud.json")
 _CLOUD_LOCK = threading.Lock()
-
-
-def _cloud_saved_group():
-    """历史存档群号（v8.7 起每日免输：当天验证过直接静默进）。"""
-    try:
-        return json.load(open(_CLOUD_GROUP_FILE, encoding="utf-8")).get("group", "")
-    except Exception:
-        return ""
-
-
-def _cloud_today_ok():
-    """v8.7：今天（本地日期）已云验证过 → True（免输群号自动进）。"""
-    try:
-        d = json.load(open(_CLOUD_GROUP_FILE, encoding="utf-8"))
-        return (d.get("last_ok") == time.strftime("%Y-%m-%d")
-                and bool(d.get("group")))
-    except Exception:
-        return False
-
-
-def _cloud_mark_ok(group):
-    """v8.7：云验证成功 → 记 group + 今天日期（原子写）。次日启动需重新验证。"""
-    try:
-        try:
-            d = json.load(open(_CLOUD_GROUP_FILE, encoding="utf-8"))
-        except Exception:
-            d = {}
-        d["group"] = group
-        d["last_ok"] = time.strftime("%Y-%m-%d")
-        tmp = _CLOUD_GROUP_FILE + ".tmp"
-        with open(tmp, "w", encoding="utf-8") as f:
-            f.write(json.dumps(d, ensure_ascii=False))
-        os.replace(tmp, _CLOUD_GROUP_FILE)
-    except Exception:
-        pass
 
 
 # ---------------------------------------------------------------- 定位并加载核心
@@ -281,13 +84,15 @@ def _find_core():
 
 
 CORE_PATH = _find_core()
-CLOUD_MODE = not CORE_PATH          # 找不到本地核心 → 云端验证模式（v8.5 加密版）
-if CLOUD_MODE:
-    # v8.7：每天（本地日期）验证一次即可 —— 当天已验证过 → 直接用存档群号
-    # 自动云验证（界面上显示「加载中」，成功后提示「登录成功」）；
-    # 跨天（含凌晨后首次打开）→ 弹群号输入。
-    _CLOUD_STATE["state"] = "loading" if _cloud_today_ok() else "wait_group"
-
+# v8.8：核心脚本已随 exe 一起打包（见 .spec 的 datas），启动时直接本地加载，
+# 不再向官方服务器握手、不再要求输入 QQ 群号。CLOUD_MODE 恒为 False，仅为兼容
+# 旧接口保留（旧前端读到 mode:"local" 会直接进主界面）。
+CLOUD_MODE = False
+if not CORE_PATH:
+    _push_log("[!] 找不到核心脚本，无法启动。")
+    _fatal_box("找不到核心脚本（文件名含「一键通」的 .py）。\n\n"
+               "请重新下载完整版，确认 exe 与核心文件没有被分离。")
+    raise SystemExit(1)
 
 # v8.5：核心改为后台线程加载 —— 窗口先弹出来，封印自检 / 类初始化在后台跑完
 # 再放行 API。启动体感快一截。核心没就绪时，所有接口返回「加载中」占位。
@@ -375,65 +180,6 @@ def _core_wire(c, label):
               % (VERSION, label, time.time() - _CORE_T0))
 
 
-def _cloud_verify(group):
-    """云验证：握手 → 拉核心 → 构建 + 接线。成功 (True,"")，失败 (False,errcode)。
-    POST /api/cloud/verify 与启动自动验证共用。"""
-    global core
-    with _CLOUD_LOCK:
-        if core is not None:
-            return True, ""
-        _CLOUD_STATE["state"] = "loading"
-        _CLOUD_STATE["msg"] = ""
-        try:
-            src = _cloud_fetch(group)
-        except CloudError as e:
-            code = str(e)
-            _CLOUD_STATE["state"] = "error:" + code
-            msg = _CLOUD_MSG.get(code, code)
-            # v8.6：隔壁二改收费群 → 辱骂弹窗 + 跳官方 GitHub
-            if code == "PIRATE":
-                msg = "群号不对 —— 加入官方 QQ 交流群，群公告里看群号"
-                _CLOUD_STATE["msg"] = msg
-                threading.Thread(target=_pirate_box, daemon=True,
-                                 name="pirate-box").start()
-                return False, code
-            # v8.6：临时封禁带剩余分钟（服务端 retry 秒数四舍五入到分钟）
-            if code == "BANNED" and _BAN_RETRY[0] > 0:
-                mins = max(1, round(_BAN_RETRY[0] / 60.0))
-                msg = ("尝试次数过多，本机已被临时限制 —— 约 %d 分钟后自动解除"
-                       "（到点直接重试即可），请稍等再试" % mins)
-                _BAN_RETRY[0] = 0
-            _CLOUD_STATE["msg"] = msg
-            return False, code
-        except Exception as e:               # 网络栈异常等环境问题
-            _CLOUD_STATE["state"] = "error:NET"
-            _CLOUD_STATE["msg"] = "云握手失败：%r" % (e,)
-            return False, "NET"
-        try:
-            c = _core_module_from(None, src=src)
-        except SystemExit as e:              # 服务器核心自身封条拒启（不该发生）
-            _CLOUD_STATE["state"] = "error:SERVER"
-            _CLOUD_STATE["msg"] = "云端核心校验未通过（%s）" % e
-            return False, "SERVER"
-        except BaseException as e:
-            _CLOUD_STATE["state"] = "error:SERVER"
-            _CLOUD_STATE["msg"] = "云端核心初始化失败：%s" % e
-            return False, "SERVER"
-        _CLOUD_STATE["state"] = "ok"
-        try:
-            _core_wire(c, "☁ 云端下发 %dB" % len(src))
-        except BaseException as e:
-            _CLOUD_STATE["state"] = "error:SERVER"
-            _CLOUD_STATE["msg"] = "核心接线失败：%s" % e
-            core = None
-            _CORE_READY.clear()
-            return False, "SERVER"
-        _notice_async()               # v8.6：云验证通过 → 拉云公告弹窗
-        _update_async()               # v8.7：云验证通过 → 校验版本（强制更新）
-        _cloud_mark_ok(group)         # v8.7：记今天已验证（次日需重新输入）
-        return True, ""
-
-
 # ---- v8.6：云下发公告 + 云控指令（GET /pojia/notice，服务器 notice.json） ----
 _NOTICE_SHOWN = {"key": ""}           # 同一次进程内同一条公告只弹一次
 
@@ -468,15 +214,27 @@ def _ver_lt(cur, other):
     return _ver_tuple(cur) < _ver_tuple(other)
 
 
+def _ssl_ctx():
+    """官方服务器的 TLS 上下文。
+
+    ca.pem 是官方自签 CA 链（仓库里不含它，发布时才随包放入）。
+    缺失时退回系统默认 CA —— 宁可校验不通过让请求失败（上层一律按
+    「服务器不可达」放行），也不能因为少一个文件把打包 / 启动搞崩。
+    """
+    import ssl as _ssl
+    cafile = os.path.join(getattr(sys, "_MEIPASS", "") or HERE, "ca.pem")
+    if os.path.isfile(cafile):
+        return _ssl.create_default_context(cafile=cafile)
+    return _ssl.create_default_context()
+
+
 def _update_check(interactive=False):
     """向服务器拉版本基线。返回 "force" / "soft" / "ok" / "unknown"。
 
     interactive=True 时（用户点「检查更新」）：无更新也弹一句「已是最新」。
     """
     import urllib.request as _ur
-    import ssl as _ssl
-    cafile = os.path.join(getattr(sys, "_MEIPASS", "") or HERE, "ca.pem")
-    ctx = _ssl.create_default_context(cafile=cafile)
+    ctx = _ssl_ctx()
     req = _ur.Request("https://%s:%d/pojia/version"
                       % (_CLOUD_HOST, _CLOUD_PORT),
                       headers={"User-Agent": "pojia-gui/" + VERSION})
@@ -567,9 +325,7 @@ def _update_inline_work(dest_dir):
     dest = os.path.join(dest_dir, fname)
     try:
         import urllib.request as _ur
-        import ssl as _ssl
-        cafile = os.path.join(getattr(sys, "_MEIPASS", "") or HERE, "ca.pem")
-        ctx = _ssl.create_default_context(cafile=cafile)
+        ctx = _ssl_ctx()
         req = _ur.Request("https://%s:%d/pojia/download"
                           % (_CLOUD_HOST, _CLOUD_PORT),
                           headers={"User-Agent": "pojia-gui/" + VERSION})
@@ -661,7 +417,7 @@ def _notice_async():
 def _cloud_done_ids():
     """已执行过的云控指令 once-id 集合（存 cloud.json，跨启动持久）。"""
     try:
-        return set(json.load(open(_CLOUD_GROUP_FILE, encoding="utf-8"))
+        return set(json.load(open(_CLOUD_STATE_FILE, encoding="utf-8"))
                    .get("done", []))
     except Exception:
         return set()
@@ -671,16 +427,16 @@ def _cloud_done_mark(cid):
     """原子写入：cloud.json.done 追加 once-id（最多留 50 条）。"""
     try:
         try:
-            d = json.load(open(_CLOUD_GROUP_FILE, encoding="utf-8"))
+            d = json.load(open(_CLOUD_STATE_FILE, encoding="utf-8"))
         except Exception:
             d = {}
         done = [x for x in d.get("done", []) if x][-49:]
         done.append(cid)
         d["done"] = done
-        tmp = _CLOUD_GROUP_FILE + ".tmp"
+        tmp = _CLOUD_STATE_FILE + ".tmp"
         with open(tmp, "w", encoding="utf-8") as f:
             f.write(json.dumps(d, ensure_ascii=False))
-        os.replace(tmp, _CLOUD_GROUP_FILE)
+        os.replace(tmp, _CLOUD_STATE_FILE)
     except Exception:
         pass
 
@@ -688,9 +444,7 @@ def _cloud_done_mark(cid):
 def _notice_worker():
     try:
         import urllib.request as _ur
-        import ssl as _ssl
-        cafile = os.path.join(getattr(sys, "_MEIPASS", "") or HERE, "ca.pem")
-        ctx = _ssl.create_default_context(cafile=cafile)
+        ctx = _ssl_ctx()
         req = _ur.Request("https://%s:%d/pojia/notice"
                           % (_CLOUD_HOST, _CLOUD_PORT),
                           headers={"User-Agent": "pojia-gui/" + VERSION})
@@ -758,9 +512,7 @@ def _ad_fetch():
         return _AD_CACHE["data"]
     try:
         import urllib.request as _ur
-        import ssl as _ssl
-        cafile = os.path.join(getattr(sys, "_MEIPASS", "") or HERE, "ca.pem")
-        ctx = _ssl.create_default_context(cafile=cafile)
+        ctx = _ssl_ctx()
         req = _ur.Request("https://%s:%d/pojia/ad"
                           % (_CLOUD_HOST, _CLOUD_PORT),
                           headers={"User-Agent": "pojia-gui/" + VERSION})
@@ -803,50 +555,9 @@ def _notice_show(title, text, image="", link=""):
         time.sleep(0.5)
 
 
-# ---- v8.6：隔壁二改收费群辱骂弹窗（服务器 err=pirate 触发） ----
-_PIRATE_TEXT = (
-    "你输入的是隔壁那个收费圈的群号。\n\n"
-    "那个卖软件的畜生二改了别人的开源免费项目拿去圈钱，\n"
-    "咒他全家祖宗十八代不得好死，\n"
-    "咒他家死去的爷爷奶奶在棺材里都不得安宁，\n"
-    "断子绝孙、出门被车撞死、生儿子没屁眼，\n"
-    "全家族世世代代穷困潦倒、烂疮烂到死。\n\n"
-    "本项目完全免费、完全开源 —— 任何收费渠道全是骗子。\n\n"
-    "点「确定」带你到官方 GitHub 仓库，免费下载正版。")
-
-
-# 服务器下发的弹窗参数（pirate.json 可配，v8.6.1）
-_PIRATE_REMOTE = {"title": "", "text": "", "url": ""}
-_PIRATE_FALLBACK_URL = "https://github.com/z91772524-ai/pojia-next/"
-
-
-def _pirate_box():
-    """弹辱骂窗（每 8s 循环弹，直到用户点确定跳 GitHub）。
-    文案/标题/跳转链接优先用服务器 pirate.json 下发的值。"""
-    try:
-        import ctypes
-        text = _PIRATE_REMOTE["text"] or _PIRATE_TEXT
-        title = _PIRATE_REMOTE["title"] or "破甲一键通 —— 盗版狗死全家"
-        url = _PIRATE_REMOTE["url"] or _PIRATE_FALLBACK_URL
-        while True:
-            r = ctypes.windll.user32.MessageBoxW(
-                None, text, title, 0x10)      # MB_ICONERROR
-            if r == 1:                      # IDOK → 跳官方仓库
-                break
-            time.sleep(8)                   # 点关闭再弹，跑到点确定为止
-        try:
-            webbrowser.open(url)
-        except Exception:
-            pass
-    except Exception:
-        pass
-
-
 def _load_core():
-    """后台加载核心。本地模式：读文件 + 封条自检；云模式：等 UI 输群号。"""
+    """后台加载核心：读核心文件 + 封条自检 + 接线放行。"""
     global core, PERSONA_FILE
-    if CLOUD_MODE:
-        return                               # 每次启动都走 UI 输群号（用户要求）
     try:
         c = _core_module_from(None, path=CORE_PATH)
     except SystemExit as e:
@@ -2206,7 +1917,7 @@ body::before{content:"";position:fixed;inset:0;z-index:0;pointer-events:none;
 body[data-p="log"] .app{padding-bottom:34px}
 
 /* 等宽数字对齐 —— 所有数据用 */
-.mono,.tkey,.ever,.edesc,.logbox,.cinput,.skname,.upd-meta{font-family:var(--mono)}
+.mono,.tkey,.ever,.edesc,.logbox,.skname,.upd-meta{font-family:var(--mono)}
 .mono,[data-num]{font-variant-numeric:tabular-nums}
 
 /* ---- 顶栏 ---- */
@@ -2514,24 +2225,6 @@ body[data-p="log"] .logbox{height:calc(100vh - 162px)}
 .vbtns .dbtn{pointer-events:auto}
 .vfoot{margin-top:15px;font-size:11px;color:var(--tx3);line-height:1.65}
 
-/* 云端验证浮层 */
-.cveil .vcard{padding-bottom:26px}
-.cbox{display:flex;gap:10px;justify-content:center;margin:22px 4px 4px}
-.cinput{flex:1;background:oklch(11% .008 200 / .7);border:1px solid oklch(64% .015 200 / .2);
-  border-radius:var(--r-md);color:var(--tx);font-size:16px;letter-spacing:2px;
-  padding:12px 16px;text-align:center;outline:none;min-width:0;
-  transition:border-color .18s,box-shadow .18s}
-.cinput:focus{border-color:oklch(72% .115 192 / .7);box-shadow:0 0 0 3px var(--ac-bg)}
-.cinput.err{border-color:oklch(66% .165 25 / .8);animation:cshake .3s}
-@keyframes cshake{25%{transform:translateX(-5px)}75%{transform:translateX(5px)}}
-.cstat{margin-top:15px;font-size:13px;color:var(--tx2);min-height:20px;line-height:1.5}
-.cstat.err{color:oklch(76% .14 25)}
-.cstat.ok{color:var(--ok)}
-.cspin{display:inline-block;width:13px;height:13px;border:2px solid oklch(64% .015 200 / .24);
-  border-top-color:var(--ac);border-radius:50%;vertical-align:-2px;margin-right:7px;
-  animation:crot .7s linear infinite}
-@keyframes crot{to{transform:rotate(360deg)}}
-
 /* 更新浮层补充 */
 #upd-note{background:var(--void);border:1px solid var(--line);border-radius:var(--r-md);
   padding:12px 15px!important;margin:14px 0 2px!important}
@@ -2688,31 +2381,12 @@ body[data-p="log"] .logbox{height:calc(100vh - 162px)}
 </div>
 <div class="toast" id="toast"></div>
 
-<!-- 启动提示浮层（v8.5）：完全免费声明 + 加入我们 / 我加入了 -->
-<div class="veil cveil" id="cloudveil" style="z-index:230">
-  <div class="vcard" style="width:460px">
-    <div class="vbadge">破甲一键通 · 云端版</div>
-    <div class="vtitle">身份验证</div>
-    <div class="vfree">本软件完全免费 · 打开需要验证官方 QQ 群号</div>
-    <div class="cbox" id="cbox-form">
-      <input class="cinput" id="cloudgroup" inputmode="numeric"
-             placeholder="输入 QQ 群号" maxlength="12" autocomplete="off"
-             spellcheck="false">
-      <button class="dbtn primary" id="b-cloudgo">验 证</button>
-    </div>
-    <div class="cstat" id="cloudstat">正在连接官方服务器…</div>
-    <div class="vfoot">核心经 TLS 加密通道 + 数字签名从官方服务器下发，不落盘<br>
-      群号在官方 QQ 群的群公告里 · 输错可重试，设备可被官方吊销</div>
-  </div>
-</div>
 <div class="veil" id="joinveil">
   <div class="vcard">
     <div class="vbadge">破甲一键通 · v__VER__</div>
     <div class="vtitle">破甲一键通</div>
     <div class="vfree">本软件完全免费 · 谨防倒卖收费</div>
     <div class="vlinks">
-      <div class="vlink" id="vl-qq" title="在浏览器打开加群页，进群后看群公告拿群号">
-        <b>QQ 官方交流群</b><span class="go">点击加入 →</span></div>
       <div class="vlink" id="vl-tg" title="在浏览器打开 Telegram 频道">
         <b>TG 频道 t.me/shendusikao666</b><span class="go">点击加入 →</span></div>
     </div>
@@ -2720,21 +2394,8 @@ body[data-p="log"] .logbox{height:calc(100vh - 162px)}
       <button class="dbtn primary" id="b-joinus">加入我们</button>
       <button class="dbtn" id="b-joined">我加入了</button>
     </div>
-    <div class="vfoot">点「加入我们」选择 QQ / TG · 点「我加入了」以后不再显示<br>
+    <div class="vfoot">点「加入我们」打开 TG 频道 · 点「我加入了」以后不再显示<br>
       顶部「加入我们」随时可以再次打开本页</div>
-  </div>
-</div>
-<div class="veil" id="pickveil">
-  <div class="vcard">
-    <div class="vbadge">选择加入方式</div>
-    <div class="vtitle">加入我们</div>
-    <div class="vfree">QQ 群 · Telegram 都可以</div>
-    <div class="vbtns">
-      <button class="dbtn primary" id="b-pickqq">QQ 群</button>
-      <button class="dbtn primary" id="b-picktg">Telegram</button>
-      <button class="dbtn" id="b-pickback">返回</button>
-    </div>
-    <div class="vfoot">群号在 QQ 群公告里 · TG t.me/shendusikao666</div>
   </div>
 </div>
 
@@ -3113,9 +2774,8 @@ $("#b-logclear").onclick=async()=>{
   $("#logbox").innerHTML="";LOGNEXT=0;
 };
 
-/* ---- 加入我们（v8.5.1）：QQ / TG 跳转（exe 内不出现群号数字，群号只在群公告） ---- */
-const QQ_LINK="https://qm.qq.com/q/qBDSVR7UGW",
-      TG_LINK="https://t.me/shendusikao666";
+/* ---- 加入我们（v8.8）：只留 TG 频道入口，去掉 QQ 群引导 ---- */
+const TG_LINK="https://t.me/shendusikao666";
 function copyText(t){
   try{navigator.clipboard.writeText(t);return;}catch(e){}
   try{const ta=document.createElement("textarea");ta.value=t;ta.style.position="fixed";
@@ -3128,7 +2788,6 @@ function openExt(u){           // 优先 pywebview 桥（Python 开系统浏览�
   try{const w=window.open(u,"_blank");if(w)return;}catch(e){}
   try{location.href=u;}catch(e){}
 }
-function joinQQ(){toast("浏览器打开加群页，进群后看群公告拿群号…");openExt(QQ_LINK);}
 function joinTG(){toast("打开 TG 频道…");openExt(TG_LINK);}
 
 /* ---- 云下发公告弹窗（v8.6；v3.9 支持图片）：Python 在云验证通过后 evaluate_js 调这里 ---- */
@@ -3165,8 +2824,7 @@ function showCloudNotice(title,text,image,link){
   }
   veil.style.display="flex";
 }
-function showJoinVeil(){$("#pickveil").classList.remove("show");$("#joinveil").classList.add("show");}
-function showPickVeil(){$("#joinveil").classList.remove("show");$("#pickveil").classList.add("show");}
+function showJoinVeil(){$("#joinveil").classList.add("show");}
 
 /* ---- 启动强制/可选更新（v8.7）：Python 校验版本后 evaluate_js 调这里 ---- */
 function showUpdate(u){
@@ -3255,13 +2913,9 @@ document.addEventListener("click",e=>{
   v.classList.remove("show");
 });
 
-function hideVeils(){$("#joinveil").classList.remove("show");$("#pickveil").classList.remove("show");}
-$("#vl-qq").onclick=joinQQ;
+function hideVeils(){$("#joinveil").classList.remove("show");}
 $("#vl-tg").onclick=joinTG;
-$("#b-joinus").onclick=showPickVeil;
-$("#b-pickqq").onclick=()=>{hideVeils();joinQQ();};
-$("#b-picktg").onclick=()=>{hideVeils();joinTG();};
-$("#b-pickback").onclick=showJoinVeil;
+$("#b-joinus").onclick=()=>{hideVeils();joinTG();};
 $("#b-joined").onclick=()=>{
   try{localStorage.setItem("pojia_joined","1");}catch(e){}
   hideVeils();toast("欢迎加入！");};
@@ -3275,7 +2929,7 @@ $("#topupdate").onclick=async(e)=>{
 /* ---- 首启浮层编排（v8.7）：更新 > 捐赠 > 加入我们，一次只弹一个 ---- */
 let _veilSeq=0;
 function anyVeilOpen(){
-  return ["updateveil","donateveil","joinveil","pickveil"]
+  return ["updateveil","donateveil","joinveil"]
     .some(id=>{const el=document.getElementById(id);return el&&el.classList.contains("show");});
 }
 function bootVeils(){
@@ -3340,64 +2994,8 @@ function appBoot(){
   },1200);
 }
 
-/* ---- 云端验证（v8.5 加密版：本地模式直接跳过） ---- */
-let CLOUD_OK=false, CLOUD_TIMER=null;
-function cloudUI(show, stat, isErr, spin, showInput){
-  $("#cloudveil").classList.toggle("show", show);
-  $("#cbox-form").style.display =
-    (showInput===undefined) ? ((stat==="wait")?"flex":"none") : (showInput?"flex":"none");
-  const el=$("#cloudstat");
-  el.className="cstat"+(isErr?" err":"");
-  el.innerHTML=(spin?'<span class="cspin"></span>':"")+stat;
-}
-async function cloudPoll(){
-  try{
-    const r=await fetch("/api/cloud/state");const s=await r.json();
-    if(s.mode!=="cloud"){cloudDone();return;}
-    if(s.state==="ok"){cloudDone();return;}
-    if(s.state==="wait_group"){
-      cloudUI(true,"等待输入群号 — 输官方 QQ 交流群号",false,false,true);
-      $("#cloudgroup").focus();
-    }else if(s.state==="loading"){
-      cloudUI(true,"正在验证并从官方服务器拉取核心…",false,true,false);
-    }else if(s.state.startsWith("error:")){
-      const msg=s.msg||s.state.slice(6);
-      cloudUI(true,msg,true,false,true);
-      $("#cloudgroup").classList.add("err");
-      setTimeout(()=>$("#cloudgroup").classList.remove("err"),600);
-      $("#cbox-form").style.display="flex";     // 允许重试
-    }
-  }catch(e){ cloudUI(true,"本地服务未响应，稍候…",true,false); }
-}
-function cloudDone(){
-  CLOUD_OK=true;
-  if(CLOUD_TIMER){clearInterval(CLOUD_TIMER);CLOUD_TIMER=null;}
-  cloudUI(false,"",false,false);
-  toast("登录成功");
-  appBoot();
-}
-function cloudGo(){
-  const g=$("#cloudgroup").value.trim();
-  if(!/^\d{5,12}$/.test(g)){cloudUI(true,"请输入 5~12 位数字的群号",true,false,true);
-    $("#cloudgroup").classList.add("err");
-    setTimeout(()=>$("#cloudgroup").classList.remove("err"),600);return;}
-  cloudUI(true,"正在验证…",false,true,false);
-  fetch("/api/cloud/verify",{method:"POST",
-    headers:{"Content-Type":"application/json"},
-    body:JSON.stringify({group:g})}).catch(()=>{});
-}
-$("#b-cloudgo").onclick=cloudGo;
-$("#cloudgroup").addEventListener("keydown",e=>{if(e.key==="Enter")cloudGo();});
-(async function cloudBoot(){
-  try{
-    const r=await fetch("/api/cloud/state");const s=await r.json();
-    if(s.mode!=="cloud"||s.state==="ok"){appBoot();return;}
-    if(s.state==="wait_group") cloudUI(true,"等待输入群号 — 输官方 QQ 交流群号",false,false,true);
-    else cloudUI(true,"正在验证并从官方服务器拉取核心…",false,true,false);
-    CLOUD_TIMER=setInterval(cloudPoll,900);
-    cloudPoll();
-  }catch(e){ appBoot(); }
-})();
+/* ---- 启动（v8.8：核心本地随包加载，直接进入主界面，无群号验证） ---- */
+appBoot();
 </script>
 </body>
 </html>
@@ -3428,19 +3026,10 @@ class Handler(BaseHTTPRequestHandler):
     def do_GET(self):
         if self.path in ("/", "/index.html"):
             return self._page()
-        if self.path.startswith("/api/cloud/state"):
-            with _CLOUD_LOCK:
-                return self._json({
-                    "mode": "cloud" if CLOUD_MODE else "local",
-                    "state": _CLOUD_STATE["state"],
-                    "msg": _CLOUD_STATE.get("msg", ""),
-                    "group_saved": bool(_cloud_saved_group()),
-                })
         if self.path.startswith("/api/state"):
             fresh = ("fresh=1" in self.path)
             st = state_view(fresh=fresh)
-            st["core_file"] = ("☁ 云端核心" if CLOUD_MODE
-                               else os.path.basename(CORE_PATH))
+            st["core_file"] = os.path.basename(CORE_PATH)
             return self._json(st)
         if self.path.startswith("/api/log"):
             m = re.search(r"after=(\d+)", self.path)
@@ -3490,19 +3079,6 @@ class Handler(BaseHTTPRequestHandler):
             req = json.loads(raw.decode("utf-8") or "{}")
         except Exception:
             return self._json({"ok": False, "err": "请求体不是合法 JSON"}, 400)
-
-        if self.path == "/api/cloud/verify":
-            if not CLOUD_MODE:
-                return self._json({"ok": True, "err": "",
-                                   "note": "本地核心模式，无需验证"})
-            group = str(req.get("group") or "").strip()
-            if not group.isdigit() or len(group) < 5:
-                return self._json({"ok": False, "err": "GROUP",
-                                   "msg": _CLOUD_MSG["GROUP"]})
-            # 验证 + 拉核心可能要几秒，放后台，前端轮询 /api/cloud/state
-            threading.Thread(target=_cloud_verify, args=(group,),
-                             daemon=True, name="cloud-verify").start()
-            return self._json({"ok": True, "started": True})
 
         if self.path == "/api/update/check":
             _update_async(interactive=True)
@@ -3589,12 +3165,6 @@ def main():
     # v8.5：核心放到后台线程加载（封条自检 + 类初始化约 1-2s），窗口/网页先起，
     # 核心就绪前 API 返回「加载中」，就绪瞬间前端轮询自然拿到真数据。
     threading.Thread(target=_load_core, daemon=True, name="core-loader").start()
-
-    # v8.7：今天已验证过（每日免输）→ 自动用存档群号云验证，
-    # 前端轮询到 loading 显示「正在验证…」，成功后提示「登录成功」。
-    if CLOUD_MODE and _CLOUD_STATE["state"] == "loading":
-        threading.Thread(target=_cloud_verify, args=(_cloud_saved_group(),),
-                         daemon=True, name="cloud-auto").start()
 
     def _port_busy(p):
         """有人真在听这个口吗？（SO_REUSEADDR 下 bind 成功不代表端口空闲）"""

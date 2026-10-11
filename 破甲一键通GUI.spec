@@ -5,13 +5,14 @@ a = Analysis(
     ['破甲GUI.py'],
     pathex=[],
     binaries=[],
-    # v8.6 云下发版：核心不再打包 —— exe 是空壳，核心源码只存服务器，
-    # 输群号 → 云握手 → 内存加载，永不落盘。
-    # 协议 v3（纯标准库）：TLS1.3+CA 链校验（ca.pem）+ HMAC + 二进制帧。
+    # v8.8 本地核心版：核心脚本 破甲一键通.py 随 exe 一起打包（data），
+    # 启动时直接从 _MEIPASS 加载 —— 不再联网握手，不再要求输入 QQ 群号。
+    # 核心自带的封条自检照常生效，被改过的核心依旧当场拒启（exit 3）。
     # cryptography 仍排除（卡巴斯基 A/B 实测）；
     # ⚠ cffi/pycparser 必须保留 —— clr_loader.ffi 顶层 import cffi，
     #   排掉它 webview 的 .NET 加载链直接断，exe 会退回浏览器模式。
-    datas=[('icon.ico', '.'), ('ca.pem', '.'), ('donate-qr.png', '.')],
+    datas=[('icon.ico', '.'), ('donate-qr.png', '.'),
+           ('破甲一键通.py', '.')],
     hiddenimports=['webview', 'webview.platforms.winforms', 'webview.platforms.edgechromium',
                    'clr_loader', 'clr_loader.ffi', 'pythonnet',
                    'argparse', 'base64', 'ctypes', 'datetime', 'glob', 'hashlib',
