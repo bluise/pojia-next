@@ -9,9 +9,11 @@ name: security
 # v8.5 起扫描两个文件：
 #   · 破甲一键通.py  —— 核心（补丁/备份/还原引擎，带封条）
 #   · 破甲GUI.py     —— 图形界面（调用核心，无封条；含环境补全下载器）
-# v8.8 变更：GUI 的 _cloud_fetch 云验证握手已移除 —— exe 不再联网取核心，
-# 改为把核心脚本 破甲一键通.py 随包打包、启动时本地加载。相应地网络白名单
-# 从六个函数收敛为五个（不再含 _cloud_fetch），__import__ 断言从 1 改为 0。
+# v8.8 变更：GUI 的云握手（_cloud_fetch 云验证 / _notice_worker 公告云控 /
+# _update_* 在线更新 / _ad_fetch 云端广告）已全部移除 —— exe 不再联网取核心、
+# 不再弹任何启动浮层，改为把核心脚本 破甲一键通.py 随包打包、启动时本地加载。
+# 相应地：网络白名单从六个收敛为一个（只剩 _env_download 环境补全下载器），
+# shell=True 断言从 1 改为 0，__import__ 断言从 1 改为 0。
 #
 # 用到的配置：仓库根目录的 .bandit.yml（逐条写明哪些告警是已知且可接受的）
 
@@ -55,18 +57,13 @@ jobs:
           # 排除项逐条写明理由，而不是把整条规则关掉不看：
           #   1) insecure-hash-sha1 —— 本项目的 sha1 只用于"人格版本标记 / 快照目录名 /
           #      补丁戳（file_sha16）"，非密码学用途，且各处显式标注 usedforsecurity=False。
-          #   2) dynamic-urllib-use-detected —— GUI 的 urllib.request 只有五个白名单函数：
+          #   2) dynamic-urllib-use-detected —— GUI 的 urllib.request 只剩一个白名单函数：
           #      _env_download(url, ...)（环境补全下载器，URL 均为脚本内字面量的 Python
-          #      官方 / 镜像源）、
-          #      _update_check()（v8.7 版本校验 GET /pojia/version）、
-          #      _notice_worker()（v8.6 公告/云控 GET /pojia/notice）、
-          #      _ad_fetch()（v8.7 云端广告 GET /pojia/ad）、
-          #      _update_inline_work()（v8.7 在线更新 GET /pojia/download）——
-          #      v8.8：云验证握手 _cloud_fetch 已移除，白名单从六个收敛为五个。
-          #      后三个的 URL 均由脚本内字面量常量 _CLOUD_HOST/_CLOUD_PORT 拼出，
-          #      TLS+CA 链校验，均非用户可控输入；call-audit job 已用 AST 断言把
-          #      urllib.request 的全部出现限定在这五个函数体内（import 恰好 5 处），
-          #      两个 job 互为佐证。
+          #      官方 / 镜像源）—— v8.8：云握手（_cloud_fetch 云验证、_notice_worker
+          #      公告云控、_update_check / _update_inline_work 在线更新、_ad_fetch
+          #      云端广告）已全部移除，白名单从六个收敛为一个。
+          #      非用户可控输入；call-audit job 已用 AST 断言把 urllib.request 的全部
+          #      出现限定在这一个函数体内（import 恰好 1 处），两个 job 互为佐证。
           EXCLUDE="--exclude-rule python.lang.security.insecure-hash-algorithms.insecure-hash-algorithm-sha1"
           EXCLUDE="$EXCLUDE --exclude-rule python.lang.security.audit.dynamic-urllib-use-detected.dynamic-urllib-use-detected"
           #   3) exec-detected —— 核心加载的 exec(compile(...)) 在
@@ -74,10 +71,8 @@ jobs:
           #      非用户输入）；call-audit job 已用 AST 断言把它锁定为「恰好
           #      1 处且在该函数体内」，比 exec 的粗粒度审计告警更精准，此处放行。
           EXCLUDE="$EXCLUDE --exclude-rule python.lang.security.audit.exec-detected.exec-detected"
-          #   4) subprocess-shell-true —— 仅 _notice_worker 云控命令一处：命令由官方
-          #      服务器下发（TLS+官方 CA 链，once-id 防重放），内存执行不落盘；与
-          #      核心云验证同一信任模型（作者本人的远程运维通道），非用户输入。
-          EXCLUDE="$EXCLUDE --exclude-rule python.lang.security.audit.subprocess-shell-true.subprocess-shell-true"
+          #   4) subprocess-shell-true —— v8.8 起 GUI 已无 shell=True（原 _notice_worker
+          #      云控通道随公告一起移除），全 0，无需放行；此处保留注释说明口径。
           semgrep --config p/python --config p/security-audit \
                   --severity ERROR --severity WARNING --error --metrics=off \
                   $EXCLUDE --json -o semgrep.json 破甲一键通.py 破甲GUI.py || true
@@ -118,22 +113,20 @@ jobs:
           if bad:
               print('核心出现不该有的调用:', bad); sys.exit(1)
 
-          # ── GUI：零网络例外 = 环境补全下载器 + 版本校验/公告/广告 + 本地端口探测 ──
-          # 例外 1：urllib.request 只允许出现在五个白名单函数体内（URL 全部由
-          #         脚本内字面量常量拼出，TLS+CA 链校验）：
-          #         _env_download（用户主动下载官方/镜像源）、
-          #         _update_check（版本校验）、
-          #         _notice_worker（公告/云控）、_ad_fetch（云端广告）、
-          #         _update_inline_work（在线更新下载，失败回退浏览器更新）
-          #         ——import 必须恰好 5 处（每函数体内 1 处），且每一处引用都
-          #         落在五个函数体内；函数体内「import + urlopen 调用」多处
-          #         字符串属正常写法，不能用「全文恰好 N 处」粗计数一刀切；
+          # ── GUI：零网络例外 = 环境补全下载器 + 本地端口探测 ──────────────
+          # 例外 1：urllib.request 只允许出现在一个白名单函数体内（URL 全部由
+          #         脚本内字面量拼出）：_env_download（用户主动下载 Python
+          #         官方 / 镜像源）——import 必须恰好 1 处，且每一处引用都落在
+          #         该函数体内；函数体内「import + urlopen 调用」多处字符串属
+          #         正常写法，不能用「全文恰好 N 处」粗计数一刀切；
+          #         v8.8：云握手（云验证 / 公告云控 / 在线更新 / 云端广告）与
+          #         启动浮层已全部移除，白名单从五个收敛为一个。
           # 例外 2：socket 只允许出现在 _port_busy（本地端口占用探测，防
           #         SO_REUSEADDR 假成功）—— 所有 connect 目标必须全是 127.0.0.1。
-          # 例外 3：exec 恰好 1 处且在 _core_module_from 体内（本地核心文件
-          #         加载；src 分支为历史云下发通道的残留，无调用方）；
-          #         __import__ 全 0（v8.8 随 _cloud_hwid 一并移除）。
-          # 其余敏感调用与核心同口径全 0。
+          # 例外 3：exec 恰好 1 处且在 _core_module_from 体内（本地随包核心
+          #         文件加载，带封条自检）；__import__ 全 0。
+          # 其余敏感调用（含 shell=True）与核心同口径全 0 —— v8.8 移除
+          # _notice_worker 后，GUI 已彻底没有 shell=True。
           GUI = '破甲GUI.py'
           gui_pats = {
               'import requests': r'(?m)^\s*import\s+requests|from\s+requests\s+import',
@@ -144,34 +137,16 @@ jobs:
               'pickle/marshal': r'\bpickle\.|\bmarshal\.',
               'subprocess 拼串命令': r'subprocess\.run\([^\[\n]*%|subprocess\.run\([^\[\n]*\.format\(',
           }
-          # GUI 例外：shell=True 仅允许 1 处，且必须落在 _notice_worker 体内
-          #         （云控命令内存执行：官方服务器 TLS 下发 + once-id 防重放，
-          #          作者本人的远程运维通道，同 bandit B602 / semgrep 排除口径）
           gsrc = open(GUI, encoding='utf-8').read()
-          bad = [n for n, c in count(GUI, gui_pats).items()
-                 if c and n != 'shell=True']   # shell=True 单独在下方 AST 断言
+          bad = [n for n, c in count(GUI, gui_pats).items() if c]
           for n, c in count(GUI, gui_pats).items():
               print('  gui  %-18s %d' % (n, c))
-          # shell=True：恰好 1 处且在 _notice_worker 体内（云控命令）才放行
-          import ast as _ast
-          _tree0 = _ast.parse(gsrc)
-          _fn_notice = [n for n in _tree0.body
-                        if isinstance(n, _ast.FunctionDef) and n.name == '_notice_worker']
-          if not _fn_notice:
-              print('GUI 里找不到 _notice_worker'); sys.exit(1)
-          _fn_notice = _fn_notice[0]
-          occ_sh = [gsrc.count(chr(10), 0, m.start()) + 1
-                    for m in re.finditer(r'shell\s*=\s*True', gsrc)]
-          if len(occ_sh) != 1 or not (_fn_notice.lineno <= occ_sh[0] <= _fn_notice.end_lineno):
-              print('GUI 的 shell=True 违规：共 %d 处 %s（应恰好 1 处且在 _notice_worker 体内）'
-                    % (len(occ_sh), occ_sh)); sys.exit(1)
-          print('  gui  shell=True         1 处（_notice_worker 云控命令，合规）')
           if bad:
               print('GUI 出现不该有的调用:', bad); sys.exit(1)
 
           import ast
           tree = ast.parse(gsrc)
-          want_fns = ('_env_download', '_update_check', '_notice_worker', '_ad_fetch', '_update_inline_work')
+          want_fns = ('_env_download',)
           fns = [n for n in tree.body
                  if isinstance(n, ast.FunctionDef) and n.name in want_fns]
           missing = [w for w in want_fns if w not in [f.name for f in fns]]
@@ -195,7 +170,7 @@ jobs:
           if n_conn != n_local:
               print('GUI 的 socket connect 存在非 127.0.0.1 目标！'); sys.exit(1)
 
-          # 例外 3 断言：exec 恰好 1 处且在 _core_module_from 体内（核心加载）；
+          # 例外 3 断言：exec 恰好 1 处且在 _core_module_from 体内（本地随包核心加载）；
           # __import__ 全 0（v8.8 移除 _cloud_hwid 后不再有任何动态导入）。
           fn_cmod = next((n for n in tree.body
                           if isinstance(n, ast.FunctionDef) and n.name == '_core_module_from'), None)

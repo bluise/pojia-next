@@ -1,5 +1,6 @@
-// 回归：v8.8 起核心随 exe 本地加载，启动时不得出现任何「输入 QQ 群号」门槛。
-// 断言页面上不存在群号输入框 / 云验证浮层，且主界面已直接就绪。
+// 回归：v8.8 起核心随 exe 本地加载，启动时不得出现任何「输入 QQ 群号」门槛；
+// 同时 v8.8 第二版把「捐赠 / 加入我们 / 检查更新」三个启动浮层一并去掉了 ——
+// 打开就是主界面，不得有任何遮罩层残留。
 const { chromium } = require('playwright');
 (async () => {
   const browser = await chromium.launch({ channel: 'chrome', headless: true });
@@ -15,6 +16,18 @@ const { chromium } = require('playwright');
       verifyBtn: !!q('#b-cloudgo'),
       qqLink: !!q('#vl-qq'),
       pickVeil: !!q('#pickveil'),
+      // 三个启动浮层：捐赠 / 加入我们 / 更新
+      donateVeil: !!q('#donateveil'),
+      joinVeil: !!q('#joinveil'),
+      updateVeil: !!q('#updateveil'),
+      // 云公告浮层（由 _notice_worker 注入，v8.8 已无调用方）
+      noticeVeil: !!q('#noticeveil'),
+      // 广告位（商业化预留，随云通道一并移除）
+      adWrap: !!q('#adwrap'),
+      // 顶栏三个入口
+      topDonate: !!q('#topdonate'),
+      topJoin: !!q('#topjoin'),
+      topUpdate: !!q('#topupdate'),
       // 主界面是否真的起来了：目标表格存在且状态接口可用
       hasTargetsTable: !!q('#tbody') || !!document.querySelector('table'),
       bodyHasQQGroupHint: /输入\s*QQ\s*群号|群号不对/.test(document.body.innerText || ''),
@@ -28,15 +41,17 @@ const { chromium } = require('playwright');
     return await res.json();
   });
   console.log('[state] core_file =', st.core_file);
-
   await browser.close();
 
   const ok1 = !r.groupInput && !r.cloudVeil && !r.verifyBtn && !r.qqLink && !r.pickVeil;
   const ok2 = !r.bodyHasQQGroupHint;
   const ok3 = !!st.core_file && st.core_file.indexOf('云端') < 0;
+  const ok4 = !(r.donateVeil || r.joinVeil || r.updateVeil || r.noticeVeil
+                || r.adWrap || r.topDonate || r.topJoin || r.topUpdate);
 
   console.log(ok1 ? 'PASS 无任何群号验证 UI' : 'FAIL 仍残留群号验证 UI');
   console.log(ok2 ? 'PASS 页面无群号提示文案' : 'FAIL 页面仍有群号提示');
   console.log(ok3 ? 'PASS 核心为本地文件（非云端下发）' : 'FAIL 核心来源异常: ' + st.core_file);
-  process.exit(ok1 && ok2 && ok3 ? 0 : 1);
+  console.log(ok4 ? 'PASS 无捐赠/加入/更新浮层与广告位' : 'FAIL 仍残留启动浮层');
+  process.exit(ok1 && ok2 && ok3 && ok4 ? 0 : 1);
 })().catch(e => { console.error('ERR', e.message); process.exit(2); });
