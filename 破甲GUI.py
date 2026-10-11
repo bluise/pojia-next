@@ -96,7 +96,7 @@ if not CORE_PATH:
 
 # v8.5：核心改为后台线程加载 —— 窗口先弹出来，封印自检 / 类初始化在后台跑完
 # 再放行 API。启动体感快一截。核心没就绪时，所有接口返回「加载中」占位。
-DISPLAY_VER = "8.7"              # GUI 显示版本（核心 VERSION 以封印文件为准）
+DISPLAY_VER = "8.8"              # GUI 显示版本（核心 VERSION 以封印文件为准）
 core = None
 PERSONA_FILE = ""
 VERSION = DISPLAY_VER
