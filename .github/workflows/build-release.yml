@@ -1,0 +1,122 @@
+name: build-release
+
+# 打包 exe + 自动发 Release。
+#   · 推 tag（v*）自动跑：git tag v8.9 && git push origin v8.9
+#   · 也可以在 Actions 页面手点「Run workflow」，tag 留空就按 GUI 的
+#     DISPLAY_VER 自动取名（重了会自动带运行号）。
+#
+# 安全扫描在 security.yml 里，与这里独立 —— 扫描挂了也会照常发版。
+# 想要「扫描不过就不发版」的话，给本文件开头加：
+#   jobs.build.needs: security
+# 并把 security.yml 的三个 job 合成一个对外可依赖的 job。
+#
+# 注意：GitHub Release 附件会把文件名里的中文剥掉，所以产出统一用
+# ASCII 名，另附一个包内保留中文名的 zip（见 pack_release.py）。
+
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "要发布的 tag，如 v8.9；留空则按 GUI 版本号自动生成"
+        required: false
+        default: ""
+
+permissions:
+  contents: write          # 建 Release + 传附件必须
+
+defaults:
+  run:
+    shell: bash            # Windows runner 默认是 pwsh，这里统一用 bash
+
+env:
+  PYTHONUTF8: "1"          # 中文路径/输出在 Windows runner 上不乱码
+  PYTHONIOENCODING: "utf-8"
+
+jobs:
+  build:
+    name: build & release
+    runs-on: windows-latest
+    steps:
+      - name: 检出代码
+        uses: actions/checkout@v4
+
+      - name: 装 Python 3.12
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: 装打包依赖
+        run: |
+          python -m pip install --disable-pip-version-check --upgrade pip
+          python -m pip install --disable-pip-version-check \
+            pyinstaller pywebview pythonnet clr-loader
+
+      - name: 核心封条自检（过了才打包，免得打出死 exe）
+        run: python 破甲一键通.py --version
+
+      - name: 打包 GUI exe
+        run: python -m PyInstaller --noconfirm --clean 破甲一键通GUI.spec
+
+      - name: 打包命令行 exe
+        run: python build_exe.py
+
+      - name: 整理附件
+        id: pack
+        run: |
+          python pack_release.py --list
+          python pack_release.py
+          # 供下一步 gh release create 用的文件名
+          {
+            echo "gui=$(ls -1 dist/pojia-gui-*-win-x64.exe | head -1)"
+            echo "cli=$(ls -1 dist/pojia-cli-*-win-x64.exe | head -1)"
+            echo "zip=$(ls -1 dist/pojia-*-win-x64.zip | head -1)"
+            echo "sums=dist/SHA256SUMS-exe.txt"
+          } >> "$GITHUB_OUTPUT"
+
+      - name: 定 tag
+        id: tag
+        run: |
+          if [ "${{ github.event_name }}" = "push" ]; then
+            echo "name=${GITHUB_REF_NAME}" >> "$GITHUB_OUTPUT"
+          elif [ -n "${{ github.event.inputs.tag }}" ]; then
+            echo "name=${{ github.event.inputs.tag }}" >> "$GITHUB_OUTPUT"
+          else
+            ver=$(python -c "
+            import re,io
+            for l in io.open('破甲GUI.py',encoding='utf-8'):
+                if l.startswith('DISPLAY_VER'):
+                    print(l.split('=')[1].split('#')[0].strip().strip('\"')); break
+            ")
+            echo "name=v${ver}-build.${GITHUB_RUN_NUMBER}" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: 建 Release 并传附件
+        id: rel
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -e
+          TAG="${{ steps.tag.outputs.name }}"
+          echo "tag=$TAG" >> "$GITHUB_OUTPUT"
+          if gh release view "$TAG" >/dev/null 2>&1; then
+            echo "Release $TAG 已存在，只补传附件"
+            gh release upload "$TAG" --clobber \
+              "${{ steps.pack.outputs.gui }}" \
+              "${{ steps.pack.outputs.cli }}" \
+              "${{ steps.pack.outputs.zip }}" \
+              "${{ steps.pack.outputs.sums }}"
+          else
+            gh release create "$TAG" \
+              --title "破甲一键通 $TAG" \
+              --notes-file dist/release-notes.md \
+              "${{ steps.pack.outputs.gui }}" \
+              "${{ steps.pack.outputs.cli }}" \
+              "${{ steps.pack.outputs.zip }}" \
+              "${{ steps.pack.outputs.sums }}"
+          fi
+          echo "url=$(gh release view "$TAG" --json url -q .url)" >> "$GITHUB_OUTPUT"
+
+      - name: 输出发布地址
+        run: echo "已发布 -> ${{ steps.rel.outputs.url }}" >> "$GITHUB_STEP_SUMMARY"
