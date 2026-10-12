@@ -18,6 +18,7 @@
 用法：
     python pack_release.py              # 整理 + 生成附件与说明
     python pack_release.py --list       # 只打印，不改文件
+    python pack_release.py --ver        # 只输出版本号（给 CI 定 tag 用）
 """
 import hashlib
 import os
@@ -63,6 +64,16 @@ def sha256(path):
 
 def main():
     ver = version()
+
+    # --ver：只吐版本号，供 CI 拼 tag。CI 里再写内联 python -c 会因为
+    # YAML 缩进被当成 Python 缩进而 IndentationError，一律走这个开关。
+    if "--ver" in sys.argv:
+        if not ver or ver == "?":
+            sys.stderr.write("[!] 取不到版本号：破甲GUI.py 里没有 DISPLAY_VER\n")
+            return 1
+        print(ver)
+        return 0
+
     write = "--list" not in sys.argv
     print("版本:", ver)
 

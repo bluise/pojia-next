@@ -91,32 +91,46 @@ jobs:
       - name: 整理附件
         id: pack
         run: |
-          python pack_release.py --list
+          set -e
           python pack_release.py
+          # 用数组取文件名，不用 ls | head —— 后者在 pipefail 下会因
+          # ls 收到 SIGPIPE 而拿到非零状态，白白把步骤整挂。
+          shopt -s nullglob
+          GUI=(dist/pojia-gui-*-win-x64.exe)
+          CLI=(dist/pojia-cli-*-win-x64.exe)
+          ZIP=(dist/pojia-*-win-x64.zip)
+          [ -n "${GUI[0]:-}" ] || { echo "[!] 没找到 GUI exe"; exit 1; }
+          [ -n "${CLI[0]:-}" ] || { echo "[!] 没找到 CLI exe"; exit 1; }
+          [ -n "${ZIP[0]:-}" ] || { echo "[!] 没找到 zip 包"; exit 1; }
           # 供下一步 gh release create 用的文件名
           {
-            echo "gui=$(ls -1 dist/pojia-gui-*-win-x64.exe | head -1)"
-            echo "cli=$(ls -1 dist/pojia-cli-*-win-x64.exe | head -1)"
-            echo "zip=$(ls -1 dist/pojia-*-win-x64.zip | head -1)"
+            echo "gui=${GUI[0]}"
+            echo "cli=${CLI[0]}"
+            echo "zip=${ZIP[0]}"
             echo "sums=dist/SHA256SUMS-exe.txt"
           } >> "$GITHUB_OUTPUT"
 
       - name: 定 tag
         id: tag
         run: |
+          set -e
           if [ "${{ github.event_name }}" = "push" ]; then
-            echo "name=${GITHUB_REF_NAME}" >> "$GITHUB_OUTPUT"
+            TAG="${GITHUB_REF_NAME}"
           elif [ -n "${{ github.event.inputs.tag }}" ]; then
-            echo "name=${{ github.event.inputs.tag }}" >> "$GITHUB_OUTPUT"
+            TAG="${{ github.event.inputs.tag }}"
           else
-            ver=$(python -c "
-            import re,io
-            for l in io.open('破甲GUI.py',encoding='utf-8'):
-                if l.startswith('DISPLAY_VER'):
-                    print(l.split('=')[1].split('#')[0].strip().strip('\"')); break
-            ")
-            echo "name=v${ver}-build.${GITHUB_RUN_NUMBER}" >> "$GITHUB_OUTPUT"
+            # 走 pack_release.py --ver，别在内联 python -c 里写多行脚本：
+            # YAML 块里的缩进会被 Python 当成代码缩进 → IndentationError，
+            # 而 runner 的 bash 带 -e，一非零退出整个步骤就挂。
+            VER="$(python pack_release.py --ver)"
+            TAG="v${VER}-build.${GITHUB_RUN_NUMBER}"
           fi
+          case "$TAG" in
+            v?*) : ;;
+            *) echo "[!] tag 不合法（必须以 v 开头）：$TAG"; exit 1 ;;
+          esac
+          echo "tag 定为：$TAG"
+          echo "name=$TAG" >> "$GITHUB_OUTPUT"
 
       - name: 建 Release 并传附件
         id: rel
