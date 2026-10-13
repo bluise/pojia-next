@@ -1,2 +1,14 @@
-7fcc5c49f619d3570044b5a1f51b2f12b3ff36197ee9072751348de768cb4880 *破甲一键通GUI.exe
-70943a4e5270e1add8f157ecb2f820537c6a07e15690585b7612324036108b82 *pojia-next-v8.6-exe.zip
+# 破甲一键通 v8.16 —— Release 附件校验（exe 版精简清单）
+#
+# GitHub 对 Release 资产文件名只允许 ASCII，所以 GUI 单文件版装在 zip 里发行
+# （v8.4 exe 包同款做法）：下载 pojia-next-v8.16-exe.zip，解压得到
+# 破甲一键通-v8.16\破甲一键通GUI.exe，双击即用。
+#
+# 两层校验：
+#   1) zip 层 —— 下载完成后直接核（Windows PowerShell）：
+#        Get-FileHash .\pojia-next-v8.16-exe.zip -Algorithm SHA256
+#   2) exe 层 —— 解压后再核一次（确保传输 / 解压没弄坏文件）：
+#        Get-FileHash .\破甲一键通-v8.16\破甲一键通GUI.exe -Algorithm SHA256
+
+cc646e5017a889379352aba0dcad1134c885dd874ae267c3997e8615ecbc09ee  pojia-next-v8.16-exe.zip
+bc94e69cd2e9183bfbc1692e52f8e6e2981b63d2abaa0117e70c7c83737dadde  破甲一键通-v8.16/破甲一键通GUI.exe
