@@ -48,7 +48,7 @@
 
 ### 1️⃣ 下载
 打开 [**Releases 页面**](https://github.com/z91772524-ai/pojia-next/releases/latest)，
-下载 **`pojia-next-v8.6-exe.zip`**，解压得到 **`破甲一键通GUI.exe`** ——
+下载 **`pojia-next-v8.16-exe.zip`**，解压得到 **`破甲一键通GUI.exe`** ——
 单文件 exe，**电脑上不用装 Python**，放哪都行（桌面就行）。
 （GitHub 对附件文件名只认英文，所以 exe 装在 zip 里发行，解压一次就行。）
 
@@ -403,7 +403,7 @@ def backup_file(path, suffix=None, bak_path=None, is_pristine=None):
 
 ### 校验下载的文件没被篡改（SHA256）
 
-仓库根目录有 [`SHA256SUMS.txt`](SHA256SUMS.txt)（覆盖仓库全部核心文件；**Release 附件另有一份 exe 版的精简校验 `SHA256SUMS-exe.txt`**：zip 下载后核一层，解压出来的 exe 再核一层），下载后自己核一遍：
+仓库根目录有 [`SHA256SUMS-exe.txt`](SHA256SUMS-exe.txt)（**Release 附件双层校验**：zip 下载后核一层，解压出来的 exe 再核一层），下载后自己核一遍：
 
 ```powershell
 # Windows PowerShell
@@ -411,17 +411,15 @@ Get-FileHash .\破甲一键通GUI.exe -Algorithm SHA256        # 与 Release 正
 ```
 ```bash
 # Linux / macOS
-sha256sum -c SHA256SUMS.txt          # 文件名对得上就直接逐项校验
+sha256sum pojia-next-v8.16-exe.zip   # 与 Release 正文里的值对照
 ```
 
-当前版本（v8.14）核心文件（完整清单见 [`SHA256SUMS.txt`](SHA256SUMS.txt)）：
+当前版本（v8.16）Release 附件（完整清单见 [`SHA256SUMS-exe.txt`](SHA256SUMS-exe.txt)）：
 
 | 文件 | SHA256（完整值见清单） | 字节 |
 |---|---|---|
-| `破甲一键通GUI.exe` | `110ffb1b1943d785d871fa70c4f223d1`… | 44157815 |
-| `破甲一键通.py` | `f470a41ac51116fd12052f8c01eecf2d`… | 351393 |
-| `破甲GUI.py` | `e622c9e8eac5e84f44eee35cab548f95`… | 228944 |
-| `一键破甲.bat` | `f9735845d490ac9bb97d242914ad8f01`… | 2958 |
+| `pojia-next-v8.16-exe.zip` | `cc646e5017a889379352aba0dcad1134`… | 43862891 |
+| `破甲一键通GUI.exe` | `bc94e69cd2e9183bfbc1692e52f8e6e2`… | 44175045 |
 | `persona.md` | `2ae4eee3c5808a2fb5467bbff3cfc761`… | 3599 |
 
 > exe 的完整哈希发布在 **Release 页面正文**里 —— 仓库源码随时会更新，而 Release 附件是定版快照，
@@ -811,13 +809,11 @@ Python 运行时和脚本一起打包成**一个 exe**，双击就跑。exe 放�
 
 | 文件 | 说明 |
 |---|---|
-| `破甲一键通GUI.exe` | **图形界面单文件版**（在 Release 的 `pojia-next-v8.6-exe.zip` 里，仓库不入库）—— 免装 Python，双击即用（v8.6 起首次启动输群号在线验证） |
-| `破甲GUI.py` | 图形界面源码（无封条，本地回环服务 + WebView2 窗口） |
-| `破甲一键通.py` | 核心引擎：补丁 / 备份 / 还原逻辑全在这（带防二改封条），GUI 与命令行共用 |
-| `一键破甲.bat` | 纯 ASCII 启动器，通配符定位 `.py`，自动找 Python |
+| `破甲一键通GUI.exe` | **图形界面单文件版**（在 Release 的 `pojia-next-v8.16-exe.zip` 里，仓库不入库）—— 免装 Python，双击即用（v8.6 起首次启动输群号在线验证） |
+| （源码） | 核心与 GUI 源码文件自 v8.15 起不再入库（历史提交中仍可查阅）；exe 里为 Cython 编译加固版，无可反编译脚本 |
 | `persona.md` | 唯一共用人格源（十五个目标共用） |
 | `使用说明.md` | 完整说明书（图文步骤、找不到安装位置怎么办） |
-| `更新日志.md` | v7.4 → v8.6 每版改了什么、升级要注意什么 |
+| `更新日志.md` | v7.4 → v8.16 每版改了什么、升级要注意什么 |
 | `小白教程.md` | 给完全没基础的朋友的六步图文教程 |
 | `修复报告.md` | v7.4 相比原工具修掉的缺陷逐条对照（每条都写了复现方式与修法） |
 | `反抄袭通告.md` | 换皮二改的完整证据、实测数据与自助验证方法 |
