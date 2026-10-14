@@ -3,3 +3,6 @@
 *.py text eol=lf
 *.md text eol=lf
 *.bat text eol=crlf
+# 校验清单必须 LF：转成 CRLF 后 sha256sum -c 会把行尾的 \r 当成文件名的一部分，
+# 每一行都报 "FAILED" / "找不到文件"。（上游 v8.16 已删掉这份清单，本 fork 源码照发所以保留）
+*.txt text eol=lf
